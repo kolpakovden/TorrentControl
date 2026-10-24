@@ -1,0 +1,86 @@
+name: Refresh film feed
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/refresh-feed.yml']
+  schedule:
+    - cron: '17,47 * * * *'
+permissions:
+  contents: write
+concurrency:
+  group: refresh-film-feed
+  cancel-in-progress: false
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fetch and validate public Atom feed, then publish snapshot
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: python
+        run: |
+          import base64, datetime, json, os, time, urllib.request, urllib.error
+          import xml.etree.ElementTree as ET
+
+          source = 'https://feed.rutracker.cc/atom/f/252.atom'
+          ns = {'a': 'http://www.w3.org/2005/Atom'}
+          xml = None
+          for attempt in range(3):
+              try:
+                  req = urllib.request.Request(source, headers={'User-Agent': 'TorrentControl-feed-monitor/1.6'})
+                  with urllib.request.urlopen(req, timeout=35) as response:
+                      if response.status != 200:
+                          raise ValueError('Unexpected HTTP status')
+                      raw = response.read(2_000_001)
+                  if len(raw) > 2_000_000:
+                      raise ValueError('Feed too large')
+                  xml = raw.decode('utf-8-sig')
+                  if '<!DOCTYPE' in xml.upper() or '<!ENTITY' in xml.upper():
+                      raise ValueError('DTD/entity declarations are not allowed')
+                  root = ET.fromstring(xml)
+                  if root.findtext('a:id', namespaces=ns) != 'tag:rto.feed,2000:/f/252':
+                      raise ValueError('Wrong forum')
+                  entries = root.findall('a:entry', ns)
+                  if not entries:
+                      raise ValueError('Empty feed; retain last successful snapshot')
+                  for entry in entries:
+                      if not entry.findtext('a:id', namespaces=ns) or not entry.findtext('a:title', namespaces=ns):
+                          raise ValueError('Malformed entry')
+                  break
+              except Exception as error:
+                  print('Fetch attempt', attempt + 1, 'failed:', type(error).__name__)
+                  if attempt == 2:
+                      raise
+                  time.sleep(5)
+
+          snapshot = {
+              'schema': 1, 'forum': 252, 'source': source,
+              'fetched_at': datetime.datetime.now(datetime.timezone.utc).isoformat(),
+              'entry_count': len(entries), 'xml': xml,
+          }
+          # GitHub credentials are sent only to api.github.com, never to the feed server.
+          endpoint = 'https://api.github.com/repos/' + os.environ['GITHUB_REPOSITORY'] + '/contents/data/forum-252.json'
+          headers = {
+              'Authorization': 'Bearer ' + os.environ['GH_TOKEN'],
+              'Accept': 'application/vnd.github+json',
+              'X-GitHub-Api-Version': '2022-11-28',
+              'User-Agent': 'TorrentControl-feed-monitor',
+          }
+          payload = {
+              'message': 'Refresh public film feed snapshot', 'branch': 'main',
+              'content': base64.b64encode((json.dumps(snapshot, ensure_ascii=False, indent=2) + '\n').encode('utf-8')).decode('ascii'),
+          }
+          try:
+              with urllib.request.urlopen(urllib.request.Request(endpoint + '?ref=main', headers=headers), timeout=30) as response:
+                  payload['sha'] = json.load(response)['sha']
+          except urllib.error.HTTPError as error:
+              if error.code != 404:
+                  raise
+          headers['Content-Type'] = 'application/json'
+          req = urllib.request.Request(endpoint, data=json.dumps(payload).encode('utf-8'), headers=headers, method='PUT')
+          with urllib.request.urlopen(req, timeout=30) as response:
+              result = json.load(response)
+          print('Published', len(entries), 'entries; snapshot time:', snapshot['fetched_at'])
+
