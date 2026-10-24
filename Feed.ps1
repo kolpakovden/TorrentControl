@@ -23,7 +23,7 @@
         [pscustomobject]@{ topic=$topic; title=$entry.SelectSingleNode('a:title',$ns).InnerText; hash=$hash; updated=$date.ToString('o'); url="https://rutracker.org/forum/viewtopic.php?t=$topic" }
     }
 }
-function Update-FilmReport($Entries, $TorrentRows, [string]$Directory) {
+function Update-FilmReport($Entries, $TorrentRows, [string]$Directory, [string]$SnapshotTime) {
     $statePath = Join-Path $Directory 'feed-state.json'
     $firstRun = !(Test-Path $statePath)
     $known = @{}
@@ -51,6 +51,7 @@ function Update-FilmReport($Entries, $TorrentRows, [string]$Directory) {
     # Only generated numeric-topic URLs are converted to links; feed text stays HTML-escaped.
     $table = [regex]::Replace($table, '<td>(https://rutracker\.org/forum/viewtopic\.php\?t=\d+)</td>', '<td><a href="$1" target="_blank" rel="noopener noreferrer">Открыть тему</a></td>')
     $intro = '<h1>Фильмы — раздел 252</h1><p>Только подборка, скачивание отключено.</p><p>Обновлено: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '</p><p>При первом запуске записи образуют исходный список. Новая для наблюдателя — тема впервые появилась после него. Дата в ленте — поле updated, не подтверждённая дата создания темы. Лента ограничена: пропущенные при долгом простое записи могут не попасть в отчёт.</p><p>Совпадения с µTorrent проверены по хешу среди всех дисков. Разные версии одного фильма могут иметь разные хеши.</p>'
+    if ($SnapshotTime) { $intro += '<p>Копия ленты получена GitHub (UTC): ' + [Net.WebUtility]::HtmlEncode($SnapshotTime) + '. Обновление копии — дважды в час; возможны задержки.</p>' }
     $html = '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Новые публикации</title><style>body{font:15px Segoe UI;margin:24px;background:#f5f7fa}table{border-collapse:collapse;width:100%;background:white}td,th{padding:9px;border:1px solid #ddd;text-align:left}th{background:#dfeafa}td{overflow-wrap:anywhere}</style><body>' + $intro + $table + '</body></html>'
     $html | Set-Content (Join-Path $Directory 'films.html') -Encoding UTF8
     $visible | Export-Csv (Join-Path $Directory 'films.csv') -NoTypeInformation -Encoding UTF8 -Delimiter ';'
@@ -58,23 +59,32 @@ function Update-FilmReport($Entries, $TorrentRows, [string]$Directory) {
     $state | ConvertTo-Json -Depth 6 | Set-Content "$statePath.tmp" -Encoding UTF8
     Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
 }
+function Convert-FilmSnapshot([string]$JsonText) {
+    $snapshot = $JsonText | ConvertFrom-Json
+    if ($snapshot.schema -ne 1 -or $snapshot.forum -ne 252 -or $snapshot.source -ne 'https://feed.rutracker.cc/atom/f/252.atom') { throw 'MirrorInvalid' }
+    $stamp = [DateTimeOffset]::Parse($snapshot.fetched_at, [Globalization.CultureInfo]::InvariantCulture)
+    $age = [DateTimeOffset]::UtcNow - $stamp
+    if ($age.TotalMinutes -lt -5) { throw 'MirrorFutureDate' }
+    if ($age.TotalHours -gt 6) { throw 'MirrorStaleOver6Hours' }
+    $entries = @(Convert-FilmFeed $snapshot.xml)
+    if (!$entries.Count -or $entries.Count -ne $snapshot.entry_count) { throw 'MirrorInvalid' }
+    return [pscustomobject]@{entries=$entries; fetchedAt=$stamp.UtcDateTime.ToString('u')}
+}
 function Collect-Films($TorrentRows, [string]$Directory) {
-    Write-Host 'Fetching film feed (network timeout: 30 seconds)...'
-    $params = @{Uri='https://feed.rutracker.cc/atom/f/252.atom';UseBasicParsing=$true;TimeoutSec=30}
-    $proxyFile = Join-Path $Directory 'feed-proxy.txt'
-    if (Test-Path $proxyFile) { $params.Proxy = (Get-Content $proxyFile -Raw).Trim() }
+    Write-Host 'Fetching film snapshot from GitHub (timeout: 30 seconds)...'
+    # The old feed-proxy.txt applies to the unreachable upstream, not this mirror.
+    $params = @{Uri='https://raw.githubusercontent.com/kolpakovden/TorrentControl/main/data/forum-252.json';UseBasicParsing=$true;TimeoutSec=30}
     $previousTls = [Net.ServicePointManager]::SecurityProtocol
     try {
-        # Windows PowerShell 5.1 can inherit legacy .NET protocol defaults.
         [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
         $response = Invoke-WebRequest @params
     } finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
     $response.RawContentStream.Position = 0
     $reader = New-Object IO.StreamReader($response.RawContentStream, (New-Object Text.UTF8Encoding($false,$true)))
-    try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
-    $entries = @(Convert-FilmFeed $xmlText)
-    Update-FilmReport $entries $TorrentRows $Directory
-    return $entries.Count
+    try { $jsonText = $reader.ReadToEnd() } finally { $reader.Dispose() }
+    $snapshot = Convert-FilmSnapshot $jsonText
+    Update-FilmReport $snapshot.entries $TorrentRows $Directory $snapshot.fetchedAt
+    return $snapshot.entries.Count
 }
 function Get-FeedErrorDetail($Exception) {
     # Only fixed type/status codes; never log response bodies, credentials or URLs.
@@ -82,6 +92,7 @@ function Get-FeedErrorDetail($Exception) {
     $current = $Exception
     for ($depth=0; $current -and $depth -lt 6; $depth++) {
         $parts += $current.GetType().Name
+        if ($current.Message -in @('MirrorInvalid','MirrorFutureDate','MirrorStaleOver6Hours')) { $parts += $current.Message }
         if ($current -is [Net.WebException]) {
             $parts += ('NetworkStatus=' + $current.Status.ToString())
             if ($current.Response -is [Net.HttpWebResponse]) { $parts += ('HTTP=' + [int]$current.Response.StatusCode) }
