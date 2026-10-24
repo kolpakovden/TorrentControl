@@ -66,3 +66,11 @@ credential.xml и state.json. После перемещения папки по�
 
 API: [BitTorrent WebUI](https://github.com/bittorrent/webui/wiki/Web-UI-API),
 [TokenSystem](https://github.com/bittorrent/webui/wiki/TokenSystem).
+
+## Лицензия
+
+Проект распространяется под [MIT License](LICENSE).
+
+Copyright (c) 2026 Denis Kolpakov (https://github.com/kolpakovden/TorrentControl).
+
+Разрешены использование, изменение, распространение и коммерческое использование при сохранении уведомления об авторстве и текста лицензии. Ссылка на исходный репозиторий включена в уведомление об авторстве.
