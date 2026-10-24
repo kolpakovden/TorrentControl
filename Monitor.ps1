@@ -35,7 +35,7 @@ function Collect {
         $saved = Get-Content "$root\state.json" -Raw | ConvertFrom-Json
         foreach ($item in $saved.items) { $previous[$item.hash] = $item }
     }
-    $states = @(); $report = @(); $unknown = 0; $excluded = 0; $protected = 0
+    $states = @(); $report = @(); $unknown = 0; $excluded = 0
     foreach ($row in $data.torrents) {
         if ($row.Count -lt 19) { throw 'Unsupported torrent row format; history was not updated.' }
         $path = ''
@@ -45,7 +45,6 @@ function Collect {
         }
         if ($path -notmatch '^[A-Za-z]:\\') { $unknown++; continue }
         if ($path -notmatch '^[DF]:\\') { $excluded++; continue }
-        if (Test-ProtectedPath $path) { $protected++; continue }
         $hash = [string]$row[0]
         $old = $null
         if ($previous.ContainsKey($hash)) { $old = $previous[$hash] }
@@ -69,12 +68,12 @@ function Collect {
     if ($unknown -gt 0) {
         $intro += '<p>Для части раздач путь неизвестен. Монитор читает resume.dat из профиля Windows и папки запущенного µTorrent. Если файл находится в другом месте, укажите его полный путь в resume-path.txt рядом с Monitor.ps1. Неизвестные пути исключены из отбора.</p>'
     }
-    $intro += "<p>Постоянное хранение D:\Хранитель (включая вложенные папки): исключено раздач — $protected.</p>"
+    $intro += '<p>Отслеживаются все раздачи на D: и F:. Весь E: — постоянное хранение; C: — системный. Оба диска исключены.</p>'
     $html = $report | ConvertTo-Html -Head $style -PreContent $intro
     $html | Set-Content "$root\report.html" -Encoding UTF8
     $report | Export-Csv "$root\report.csv" -NoTypeInformation -Encoding UTF8 -Delimiter ';'
     Save-Json @{ version = 1; updated = $now; items = @($states) } "$root\state.json"
-    Add-Content "$root\monitor.log" "$stamp OK: D/F=$($states.Count), unknown=$unknown, excluded=$excluded, protected=$protected" -Encoding UTF8
+    Add-Content "$root\monitor.log" "$stamp OK: D/F=$($states.Count), unknown=$unknown, excluded=$excluded" -Encoding UTF8
     Write-Host "OK: $($states.Count) torrents on D/F. Report: $root\report.html"
 }
 try {

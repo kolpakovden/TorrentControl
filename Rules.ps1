@@ -24,16 +24,9 @@
     }
 }
 function Get-Decision($State, [long]$Now) {
-    if (Test-ProtectedPath $State.path) { return 'Постоянное хранение — исключено' }
     if (!$State.complete) { return 'Загрузка не завершена' }
     if (!$State.running -or !$State.knownPeers) { return 'Недостаточно данных / остановлена' }
     if ($State.demand) { return 'Есть спрос' }
     if (($Now - $State.firstSeen) -ge 30*86400 -and ($Now - $State.quietSince) -ge 14*86400) { return 'Кандидат на удаление' }
     return 'Наблюдение'
-}
-function Test-ProtectedPath([string]$Path) {
-    try {
-        $normalized = [IO.Path]::GetFullPath($Path.Replace('/', '\')).TrimEnd('\')
-        return ($normalized -ieq 'D:\Хранитель' -or $normalized.StartsWith('D:\Хранитель\', [StringComparison]::OrdinalIgnoreCase))
-    } catch { return $true }
 }
