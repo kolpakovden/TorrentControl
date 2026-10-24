@@ -1,0 +1,13 @@
+# Local credentials, connection settings, history and generated reports
+credential.xml
+config.json
+resume-path.txt
+state.json
+*.tmp
+*.log
+*.lock
+report.html
+report.csv
+resume.dat*
+*.torrent
+*.zip
