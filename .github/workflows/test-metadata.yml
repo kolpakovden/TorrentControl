@@ -1,0 +1,102 @@
+name: Test magnet metadata only
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths: ['.github/workflows/test-metadata.yml']
+permissions:
+  contents: write
+concurrency:
+  group: metadata-test
+  cancel-in-progress: false
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    timeout-minutes: 8
+    steps:
+      - name: Install metadata client
+        run: sudo apt-get update -qq && sudo apt-get install -y aria2
+      - name: Retrieve one torrent metadata only
+        shell: python
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          import base64, datetime, hashlib, json, os, pathlib, re, subprocess, tempfile, urllib.request, urllib.error
+          import xml.etree.ElementTree as ET
+          repo = os.environ['GITHUB_REPOSITORY']
+          headers = {'Authorization': 'Bearer ' + os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'TorrentControl-metadata-test'}
+          def get(path):
+              with urllib.request.urlopen(urllib.request.Request('https://api.github.com/repos/' + repo + '/contents/' + path, headers=headers), timeout=30) as r:
+                  return json.load(r)
+          feed = json.loads(base64.b64decode(get('data/forum-252.json')['content']))
+          ns = {'a':'http://www.w3.org/2005/Atom'}
+          root = ET.fromstring(feed['xml'])
+          chosen = None
+          for entry in root.findall('a:entry', ns):
+              for link in entry.findall('a:link', ns):
+                  match = re.search(r'urn:btih:([0-9a-fA-F]{40})(?:&|$)', link.get('href',''))
+                  if link.get('rel') == 'enclosure' and match:
+                      chosen = (match[1].upper(), entry.findtext('a:title', namespaces=ns))
+                      break
+              if chosen:
+                  break
+          if not chosen:
+              raise ValueError('No magnet in feed')
+          infohash, title = chosen
+          result = {'schema':1, 'hash':infohash, 'title':title, 'tested_at':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'status':'unavailable', 'payload_download_enabled':False}
+          with tempfile.TemporaryDirectory() as tmp:
+              # No user config, RPC, cookies, trackers or application credentials go to peers.
+              args = ['aria2c','--no-conf','--bt-metadata-only=true','--bt-save-metadata=true','--enable-dht=true','--enable-dht6=false','--bt-enable-lpd=false','--seed-time=0','--stop=150','--summary-interval=30','--dir='+tmp,'--dht-file-path='+tmp+'/dht.dat','magnet:?xt=urn:btih:'+infohash]
+              child_env = {k:v for k,v in os.environ.items() if k not in ('GH_TOKEN','GITHUB_TOKEN')}
+              try:
+                  run = subprocess.run(args, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=175)
+                  result['client_exit_code'] = run.returncode
+              except subprocess.TimeoutExpired:
+                  result['status'] = 'timeout'
+              files = list(pathlib.Path(tmp).glob('*.torrent'))
+              if len(files) == 1:
+                  raw = files[0].read_bytes()
+                  if len(raw) > 4_000_000:
+                      raise ValueError('Oversized metadata')
+                  pos = 0
+                  info_span = None
+                  def decode(depth=0):
+                      global pos, info_span
+                      if depth > 32:
+                          raise ValueError('Nesting')
+                      start = pos
+                      c = raw[pos:pos+1]
+                      pos += 1
+                      if c == b'i':
+                          end = raw.index(b'e',pos); value = int(raw[pos:end]); pos = end+1; return value
+                      if c == b'l':
+                          value = []
+                          while raw[pos:pos+1] != b'e': value.append(decode(depth+1))
+                          pos += 1; return value
+                      if c == b'd':
+                          value = {}
+                          while raw[pos:pos+1] != b'e':
+                              key = decode(depth+1); begin = pos
+                              if not isinstance(key, bytes) or key in value: raise ValueError('Invalid dictionary')
+                              value[key] = decode(depth+1)
+                              if depth == 0 and key == b'info': info_span = (begin,pos)
+                          pos += 1; return value
+                      pos = start
+                      end = raw.index(b':',pos); length = int(raw[pos:end]); pos = end+1
+                      if length < 0 or pos+length > len(raw): raise ValueError('String bounds')
+                      value = raw[pos:pos+length]; pos += length; return value
+                  torrent = decode()
+                  if pos != len(raw) or not info_span or hashlib.sha1(raw[slice(*info_span)]).hexdigest().upper() != infohash:
+                      raise ValueError('Infohash mismatch')
+                  info = torrent[b'info']
+                  lengths = [f[b'length'] for f in info[b'files']] if b'files' in info else [info[b'length']]
+                  if any(type(n) is not int or n < 0 for n in lengths): raise ValueError('Invalid sizes')
+                  result.update(status='success', total_bytes=sum(lengths), file_count=len(lengths), metadata_bytes=len(raw), torrent_base64=base64.b64encode(raw).decode('ascii'))
+          path = 'data/metadata-test.json'
+          payload = {'message':'Record metadata-only probe result', 'branch':'main', 'content':base64.b64encode((json.dumps(result,ensure_ascii=False,indent=2)+'\n').encode()).decode()}
+          try: payload['sha'] = get(path)['sha']
+          except urllib.error.HTTPError as e:
+              if e.code != 404: raise
+          req = urllib.request.Request('https://api.github.com/repos/'+repo+'/contents/'+path, data=json.dumps(payload).encode(), headers={**headers,'Content-Type':'application/json'}, method='PUT')
+          with urllib.request.urlopen(req,timeout=30) as r: json.load(r)
+          print(json.dumps({k:v for k,v in result.items() if k != 'torrent_base64'},ensure_ascii=False))
