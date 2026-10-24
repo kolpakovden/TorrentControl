@@ -59,14 +59,35 @@ function Update-FilmReport($Entries, $TorrentRows, [string]$Directory) {
     Move-Item -LiteralPath "$statePath.tmp" -Destination $statePath -Force
 }
 function Collect-Films($TorrentRows, [string]$Directory) {
+    Write-Host 'Fetching film feed (network timeout: 30 seconds)...'
     $params = @{Uri='https://feed.rutracker.cc/atom/f/252.atom';UseBasicParsing=$true;TimeoutSec=30}
     $proxyFile = Join-Path $Directory 'feed-proxy.txt'
     if (Test-Path $proxyFile) { $params.Proxy = (Get-Content $proxyFile -Raw).Trim() }
-    $response = Invoke-WebRequest @params
+    $previousTls = [Net.ServicePointManager]::SecurityProtocol
+    try {
+        # Windows PowerShell 5.1 can inherit legacy .NET protocol defaults.
+        [Net.ServicePointManager]::SecurityProtocol = $previousTls -bor [Net.SecurityProtocolType]::Tls12
+        $response = Invoke-WebRequest @params
+    } finally { [Net.ServicePointManager]::SecurityProtocol = $previousTls }
     $response.RawContentStream.Position = 0
     $reader = New-Object IO.StreamReader($response.RawContentStream, (New-Object Text.UTF8Encoding($false,$true)))
     try { $xmlText = $reader.ReadToEnd() } finally { $reader.Dispose() }
     $entries = @(Convert-FilmFeed $xmlText)
     Update-FilmReport $entries $TorrentRows $Directory
     return $entries.Count
+}
+function Get-FeedErrorDetail($Exception) {
+    # Only fixed type/status codes; never log response bodies, credentials or URLs.
+    $parts = @()
+    $current = $Exception
+    for ($depth=0; $current -and $depth -lt 6; $depth++) {
+        $parts += $current.GetType().Name
+        if ($current -is [Net.WebException]) {
+            $parts += ('NetworkStatus=' + $current.Status.ToString())
+            if ($current.Response -is [Net.HttpWebResponse]) { $parts += ('HTTP=' + [int]$current.Response.StatusCode) }
+        }
+        if ($current -is [Net.Sockets.SocketException]) { $parts += ('Socket=' + $current.SocketErrorCode.ToString()) }
+        $current = $current.InnerException
+    }
+    return ($parts -join '; ')
 }
