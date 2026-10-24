@@ -8,6 +8,10 @@ state.json
 *.lock
 report.html
 report.csv
+films.html
+films.csv
+feed-state.json
+feed-proxy.txt
 resume.dat*
 *.torrent
 *.zip

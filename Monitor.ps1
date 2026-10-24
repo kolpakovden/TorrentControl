@@ -3,6 +3,7 @@ $ErrorActionPreference = 'Stop'
 $root = $PSScriptRoot
 . "$root\Rules.ps1"
 . "$root\LocalPaths.ps1"
+. "$root\Feed.ps1"
 function Save-Json($Value, $Path) {
     $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$Path.tmp" -Encoding UTF8
     Move-Item -LiteralPath "$Path.tmp" -Destination $Path -Force
@@ -28,6 +29,13 @@ function Collect {
     $config = Get-Content "$root\config.json" -Raw | ConvertFrom-Json
     $credential = Import-Clixml "$root\credential.xml"
     $data = Fetch-List $config $credential
+    $feedMessage = 'Подборка фильмов не обновлена; подробности в monitor.log.'
+    try {
+        $feedCount = Collect-Films $data.torrents $root
+        $feedMessage = "Подборка фильмов обновлена: $feedCount записей."
+    } catch {
+        Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $($_.Exception.GetType().Name). Torrent monitoring continues." -Encoding UTF8
+    }
     $localPaths = Read-LocalPaths
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $previous = @{}
@@ -69,6 +77,7 @@ function Collect {
         $intro += '<p>Для части раздач путь неизвестен. Монитор читает resume.dat из профиля Windows и папки запущенного µTorrent. Если файл находится в другом месте, укажите его полный путь в resume-path.txt рядом с Monitor.ps1. Неизвестные пути исключены из отбора.</p>'
     }
     $intro += '<p>Отслеживаются все раздачи на D: и F:. Весь E: — постоянное хранение; C: — системный. Оба диска исключены.</p>'
+    $intro += "<p>$feedMessage <a href='films.html'>Открыть публикации раздела 252</a></p>"
     $html = $report | ConvertTo-Html -Head $style -PreContent $intro
     $html | Set-Content "$root\report.html" -Encoding UTF8
     $report | Export-Csv "$root\report.csv" -NoTypeInformation -Encoding UTF8 -Delimiter ';'
