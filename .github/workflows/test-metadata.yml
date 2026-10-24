@@ -36,17 +36,17 @@ jobs:
               for link in entry.findall('a:link', ns):
                   match = re.search(r'urn:btih:([0-9a-fA-F]{40})(?:&|$)', link.get('href',''))
                   if link.get('rel') == 'enclosure' and match:
-                      chosen = (match[1].upper(), entry.findtext('a:title', namespaces=ns))
+                      chosen = (match[1].upper(), entry.findtext('a:title', namespaces=ns), link.get('href'))
                       break
               if chosen:
                   break
           if not chosen:
               raise ValueError('No magnet in feed')
-          infohash, title = chosen
+          infohash, title, magnet = chosen
           result = {'schema':1, 'hash':infohash, 'title':title, 'tested_at':datetime.datetime.now(datetime.timezone.utc).isoformat(), 'status':'unavailable', 'payload_download_enabled':False}
           with tempfile.TemporaryDirectory() as tmp:
-              # No user config, RPC, cookies, trackers or application credentials go to peers.
-              args = ['aria2c','--no-conf','--bt-metadata-only=true','--bt-save-metadata=true','--enable-dht=true','--enable-dht6=false','--bt-enable-lpd=false','--seed-time=0','--stop=150','--summary-interval=30','--dir='+tmp,'--dht-file-path='+tmp+'/dht.dat','magnet:?xt=urn:btih:'+infohash]
+              # No user config, RPC, cookies or application credentials go to peers; use the public feed magnet.
+              args = ['aria2c','--no-conf','--bt-metadata-only=true','--bt-save-metadata=true','--enable-dht=true','--enable-dht6=false','--bt-enable-lpd=false','--seed-time=0','--stop=150','--summary-interval=30','--dir='+tmp,'--dht-file-path='+tmp+'/dht.dat',magnet]
               child_env = {k:v for k,v in os.environ.items() if k not in ('GH_TOKEN','GITHUB_TOKEN')}
               try:
                   run = subprocess.run(args, env=child_env, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=175)
