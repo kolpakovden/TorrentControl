@@ -34,7 +34,10 @@ function Collect {
         $feedCount = Collect-Films $data.torrents $root
         $feedMessage = "Подборка фильмов обновлена: $feedCount записей."
     } catch {
-        Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $($_.Exception.GetType().Name). Torrent monitoring continues." -Encoding UTF8
+        $detail = Get-FeedErrorDetail $_.Exception
+        $feedMessage = "Подборка фильмов не обновлена: $detail."
+        Write-Host "Feed failed: $detail" -ForegroundColor Yellow
+        Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $detail. Torrent monitoring continues." -Encoding UTF8
     }
     $localPaths = Read-LocalPaths
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
