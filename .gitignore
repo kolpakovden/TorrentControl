@@ -15,3 +15,11 @@ feed-proxy.txt
 resume.dat*
 *.torrent
 *.zip
+autoload.json
+auto-state.json
+auto-downloads.html
+metadata-cache/
+metadata-tools/
+metadata-probe/
+tests/autoload-test-*/
+__pycache__/

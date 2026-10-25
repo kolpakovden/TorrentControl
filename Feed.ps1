@@ -50,7 +50,7 @@ function Update-FilmReport($Entries, $TorrentRows, [string]$Directory, [string]$
     $table = ($visible | Sort-Object Дата_в_ленте -Descending | ConvertTo-Html -Fragment) -join "`n"
     # Only generated numeric-topic URLs are converted to links; feed text stays HTML-escaped.
     $table = [regex]::Replace($table, '<td>(https://rutracker\.org/forum/viewtopic\.php\?t=\d+)</td>', '<td><a href="$1" target="_blank" rel="noopener noreferrer">Открыть тему</a></td>')
-    $intro = '<h1>Фильмы — раздел 252</h1><p>Только подборка, скачивание отключено.</p><p>Обновлено: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '</p><p>При первом запуске записи образуют исходный список. Новая для наблюдателя — тема впервые появилась после него. Дата в ленте — поле updated, не подтверждённая дата создания темы. Лента ограничена: пропущенные при долгом простое записи могут не попасть в отчёт.</p><p>Совпадения с µTorrent проверены по хешу среди всех дисков. Разные версии одного фильма могут иметь разные хеши.</p>'
+    $intro = '<h1>Фильмы — раздел 252</h1><p>Подборка публикаций. Состояние автозагрузки показано в основном отчёте.</p><p>Обновлено: ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss') + '</p><p>При первом запуске записи образуют исходный список. Новая для наблюдателя — тема впервые появилась после него. Дата в ленте — поле updated, не подтверждённая дата создания темы. Лента ограничена: пропущенные при долгом простое записи могут не попасть в отчёт.</p><p>Совпадения с µTorrent проверены по хешу среди всех дисков. Разные версии одного фильма могут иметь разные хеши.</p>'
     if ($SnapshotTime) { $intro += '<p>Копия ленты получена GitHub (UTC): ' + [Net.WebUtility]::HtmlEncode($SnapshotTime) + '. Обновление копии — дважды в час; возможны задержки.</p>' }
     $html = '<!doctype html><html lang="ru"><meta charset="utf-8"><title>Новые публикации</title><style>body{font:15px Segoe UI;margin:24px;background:#f5f7fa}table{border-collapse:collapse;width:100%;background:white}td,th{padding:9px;border:1px solid #ddd;text-align:left}th{background:#dfeafa}td{overflow-wrap:anywhere}</style><body>' + $intro + $table + '</body></html>'
     $html | Set-Content (Join-Path $Directory 'films.html') -Encoding UTF8
@@ -71,6 +71,7 @@ function Convert-FilmSnapshot([string]$JsonText) {
     return [pscustomobject]@{entries=$entries; fetchedAt=$stamp.UtcDateTime.ToString('u')}
 }
 function Collect-Films($TorrentRows, [string]$Directory) {
+    $script:LatestFilmEntries=$null
     Write-Host 'Fetching film snapshot from GitHub (timeout: 30 seconds)...'
     # The old feed-proxy.txt applies to the unreachable upstream, not this mirror.
     $params = @{Uri='https://raw.githubusercontent.com/kolpakovden/TorrentControl/main/data/forum-252.json';UseBasicParsing=$true;TimeoutSec=30}
@@ -84,6 +85,7 @@ function Collect-Films($TorrentRows, [string]$Directory) {
     try { $jsonText = $reader.ReadToEnd() } finally { $reader.Dispose() }
     $snapshot = Convert-FilmSnapshot $jsonText
     Update-FilmReport $snapshot.entries $TorrentRows $Directory $snapshot.fetchedAt
+    $script:LatestFilmEntries=$snapshot.entries
     return $snapshot.entries.Count
 }
 function Get-FeedErrorDetail($Exception) {

@@ -75,7 +75,13 @@ def main():
         try:
             with urllib.request.urlopen(urllib.request.Request(api+path+'?ref=main', headers=headers), timeout=30) as r:
                 resource = json.load(r)
-            return json.loads(base64.b64decode(resource['content'])), resource['sha']
+            if resource.get('encoding') == 'base64':
+                decoded = base64.b64decode(resource['content'])
+            else:
+                with urllib.request.urlopen('https://raw.githubusercontent.com/'+repo+'/main/'+path, timeout=30) as r:
+                    decoded = r.read(6_000_001)
+                if len(decoded) > 6_000_000: raise ValueError('cache too large')
+            return json.loads(decoded), resource['sha']
         except urllib.error.HTTPError as e:
             if e.code == 404: return None, None
             raise

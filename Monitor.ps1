@@ -4,6 +4,7 @@ $root = $PSScriptRoot
 . "$root\Rules.ps1"
 . "$root\LocalPaths.ps1"
 . "$root\Feed.ps1"
+. "$root\AutoLoad.ps1"
 function Save-Json($Value, $Path) {
     $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$Path.tmp" -Encoding UTF8
     Move-Item -LiteralPath "$Path.tmp" -Destination $Path -Force
@@ -40,6 +41,14 @@ function Collect {
         Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $detail. Torrent monitoring continues." -Encoding UTF8
     }
     $localPaths = Read-LocalPaths
+    $autoMessage='Автозагрузка ждёт свежую ленту.'
+    if ($null -ne $script:LatestFilmEntries) {
+        try {$autoMessage=Invoke-AutoLoad $script:LatestFilmEntries $data.torrents $localPaths $config $credential $root}
+        catch {
+            $autoMessage='Автозагрузка приостановлена из-за ошибки; см. monitor.log.'
+            Add-Content "$root\monitor.log" "$(Get-Date -Format s) AUTO ERROR: $($_.Exception.GetType().Name); $(Get-AutoErrorCode $_.Exception)" -Encoding UTF8
+        }
+    }
     $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
     $previous = @{}
     if (Test-Path "$root\state.json") {
@@ -74,13 +83,15 @@ function Collect {
     }
     $report = @($report | Sort-Object Решение, Название)
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $intro = "<h1>Монитор временных раздач</h1><p>Обновлено: $stamp · Только отчёт, удаление отключено.</p><p>Раздач D/F: $($states.Count). Другие диски: $excluded. Путь не определён: $unknown.</p><p>Кандидат: 30 дней наблюдаемого хранения и 14 дней без замеченного спроса. Перерыв в проверках более часа, остановка или ошибка сбрасывают период тишины. Сиды не влияют на решение.</p>"
+    $intro = "<h1>Монитор временных раздач</h1><p>Обновлено: $stamp · Мониторинг раздач; удаление отключено.</p><p>Раздач D/F: $($states.Count). Другие диски: $excluded. Путь не определён: $unknown.</p><p>Кандидат: 30 дней наблюдаемого хранения и 14 дней без замеченного спроса. Перерыв в проверках более часа, остановка или ошибка сбрасывают период тишины. Сиды не влияют на решение.</p>"
     $style = '<meta charset="utf-8"><style>body{font:15px Segoe UI;margin:28px;background:#f5f7fa}table{border-collapse:collapse;background:white;width:100%}td,th{padding:9px;border:1px solid #ddd;text-align:left}th{background:#dfeafa}h1{color:#17365d}</style>'
     if ($unknown -gt 0) {
         $intro += '<p>Для части раздач путь неизвестен. Монитор читает resume.dat из профиля Windows и папки запущенного µTorrent. Если файл находится в другом месте, укажите его полный путь в resume-path.txt рядом с Monitor.ps1. Неизвестные пути исключены из отбора.</p>'
     }
     $intro += '<p>Отслеживаются все раздачи на D: и F:. Весь E: — постоянное хранение; C: — системный. Оба диска исключены.</p>'
     $intro += "<p>$feedMessage <a href='films.html'>Открыть публикации раздела 252</a></p>"
+    $intro += '<p>'+[Net.WebUtility]::HtmlEncode($autoMessage)+'</p>'
+    if (Test-Path "$root\auto-downloads.html") {$intro += '<p><a href="auto-downloads.html">Журнал автозагрузки</a></p>'}
     $html = $report | ConvertTo-Html -Head $style -PreContent $intro
     $html | Set-Content "$root\report.html" -Encoding UTF8
     $report | Export-Csv "$root\report.csv" -NoTypeInformation -Encoding UTF8 -Delimiter ';'
@@ -90,7 +101,7 @@ function Collect {
 }
 try {
     if ($Setup) {
-        Write-Host 'Setup on the torrent computer. No torrents or files will be changed.'
+        Write-Host 'Setup on the torrent computer. Autoload follows your local autoload.json settings.'
         $url = Read-Host 'WebUI URL [http://127.0.0.1:9090]'
         if (!$url) { $url = 'http://127.0.0.1:9090' }
         $parsed = [uri]$url
@@ -100,7 +111,8 @@ try {
         $null = Fetch-List ([pscustomobject]@{url=$url}) $credential
         $credential | Export-Clixml "$root\credential.xml"
         Save-Json @{url=$url} "$root\config.json"
-        Collect
+        $setupLock=[IO.File]::Open("$root\monitor.lock",'OpenOrCreate','ReadWrite','None')
+        try {Collect} finally {$setupLock.Dispose()}
         $taskName = 'TorrentMonitor-DF'
         $exe = "$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe"
         $action = New-ScheduledTaskAction -Execute $exe -Argument "-NoProfile -NonInteractive -WindowStyle Hidden -ExecutionPolicy Bypass -File `"$root\Monitor.ps1`" -Once" -WorkingDirectory $root
