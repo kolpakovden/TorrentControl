@@ -1,0 +1,30 @@
+name: Cache film metadata
+on:
+  workflow_dispatch:
+  workflow_run:
+    workflows: ['Refresh film feed']
+    types: [completed]
+  schedule:
+    - cron: '23,53 * * * *'
+  push:
+    branches: [main]
+    paths: ['scripts/cache_metadata.py', '.github/workflows/cache-metadata.yml']
+permissions:
+  contents: write
+concurrency:
+  group: film-metadata-cache
+  cancel-in-progress: false
+jobs:
+  cache:
+    if: github.event_name != 'workflow_run' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 12
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+          persist-credentials: false
+      - run: sudo apt-get update -qq && sudo apt-get install -y aria2
+      - run: python scripts/cache_metadata.py
+        env:
+          GH_TOKEN: ${{ github.token }}
