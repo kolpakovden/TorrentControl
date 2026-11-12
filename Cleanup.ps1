@@ -64,7 +64,7 @@ function Get-CleanupDecision($Entry, [long]$Now, [string]$ListProblem = '', $Own
     if ($script:CleanupNotes.ContainsKey([string]$state.uploadNote)) { $note = ' (последний перезапуск: ' + $script:CleanupNotes[[string]$state.uploadNote] + ')' }
     $problem = Get-TorrentRowProblem $row
     $decision = 'Кандидат на очистку'
-    $reason = 'Полностью скачана, наблюдается не менее 30 дней, отдача менее 1 ГиБ в каждые из трёх суток, сейчас нет отдачи и пиров'
+    $reason = 'Менее 1 ГиБ в каждые из трёх суток; сейчас нет отдачи и пиров'
     if ($path -notmatch '^[DF]:\\') { $decision = 'Оставить'; $reason = 'Защищённый диск: очищаются только D: и F:' }
     elseif ($ListProblem) { $decision = 'Недостаточно данных'; $reason = 'Некорректный ответ WebUI (' + $ListProblem + ')' }
     elseif ($problem) { $decision = 'Недостаточно данных'; $reason = 'Некорректные данные раздачи (' + $problem + ')' }
@@ -130,7 +130,8 @@ function Write-CleanupReport($Decisions, [string]$Directory, [string]$Mode, [lon
         $intro += '<p>Отдача считается по накопительному счётчику UPLOADED µTorrent между соседними опросами. Каждые «сутки» — это 25 целых часов UTC, которые содержат соответствующие 24 часа; интервалы опроса на границе засчитываются целиком. Поэтому значения в столбцах «Сутки» — верхняя оценка: реальная отдача не больше. Нужна непрерывная история не меньше 73 часов: пропуск опросов более 60 минут, сброс счётчика, смена пути, остановка раздачи или повреждение истории начинают её заново. Неизвестная активность никогда не считается нулём («н/д»).</p>'
     }
     $style = '<meta charset="utf-8"><style>body{font:15px Segoe UI;margin:24px;background:#f5f7fa}table{border-collapse:collapse;background:white;width:100%}td,th{padding:8px;border:1px solid #ddd;text-align:left}th{background:#dfeafa}.dry{font-size:20px;font-weight:bold;color:#8a1c1c;background:#fde8e8;border:2px solid #8a1c1c;padding:10px}.warn{color:#8a5a00}</style>'
-    $html = $rows | ConvertTo-Html -Head $style -PreContent $intro -PostContent ('<p class="dry">' + $script:CleanupBanner + '</p>')
+    # HTML carries the banner above and below the table; every CSV row carries it in "Режим".
+    $html = $rows | Select-Object -Property * -ExcludeProperty Режим | ConvertTo-Html -Head $style -PreContent $intro -PostContent ('<p class="dry">' + $script:CleanupBanner + '</p>')
     $html | Set-Content (Join-Path $Directory 'cleanup.html') -Encoding UTF8
     $csvPath = Join-Path $Directory 'cleanup.csv'
     if ($rows.Count) { $rows | Export-Csv $csvPath -NoTypeInformation -Encoding UTF8 -Delimiter ';' }
