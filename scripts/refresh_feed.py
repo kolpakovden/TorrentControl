@@ -216,7 +216,10 @@ def fetch_validated(fetch, now, attempts=3, sleep=time.sleep):
     raise last
 
 
-def publish(github, snapshot, previous, sha, message):
+COVERAGE_KEYS = ('coverage', 'previous_fetched_at', 'gap_hours', 'oldest_entry_updated')
+
+
+def publish(github, snapshot, previous, sha, message, entries):
     """Publish unless a newer snapshot is already there. Returns 'published' or 'superseded'."""
     mine = snapshot_time(snapshot)
     for _ in range(3):
@@ -225,34 +228,70 @@ def publish(github, snapshot, previous, sha, message):
             return 'superseded'
         if github.put(SNAPSHOT_PATH, snapshot, sha, message) == 'ok':
             return 'published'
+        # Another run published meanwhile: recompute everything that depends on the previous snapshot.
         previous, sha = github.get(SNAPSHOT_PATH)
         snapshot['sequence'] = next_sequence(previous)
+        for key in COVERAGE_KEYS:
+            snapshot.pop(key, None)
+        snapshot.update(coverage(previous, entries, mine))
     raise FeedError('GitHubConflict')
 
 
-def record_status(github, now, error, trigger, run_id, snapshot_at=None):
-    """Failure: write the code. Success after a failure: clear it. Never fatal."""
+def record_status(github, now, error, trigger, run_id, snapshot_at=None, started=None):
+    """Failure: write the code. Success after a failure: clear it. Never fatal.
+
+    Runs may overlap, so the status only moves forward in time: a failure is dropped when a snapshot
+    fetched after this run started trying is already published, or when a newer status exists; a
+    success clears only an error recorded before its own snapshot was fetched.
+    """
     try:
-        status, sha = github.get(STATUS_PATH)
-        if error is None and not (status and status.get('last_error')):
-            return
-        failures = 0
-        if error is not None:
-            failures = 1
-            if status and status.get('last_error'):
+        for _ in range(2):
+            status, sha = github.get(STATUS_PATH)
+            recorded = None
+            if status:
                 try:
-                    failures = int(status.get('consecutive_failures', 0)) + 1
+                    recorded = parse_time(status.get('last_attempt_at'))
                 except (TypeError, ValueError):
-                    failures = 1
-        new = {'schema': 1, 'last_attempt_at': now.isoformat(), 'last_error': error or '',
-               'consecutive_failures': failures, 'trigger': trigger, 'run_id': run_id}
-        if error is None:
-            new['last_success_at'] = (snapshot_at or now).isoformat()
-        elif status and status.get('last_success_at'):
-            new['last_success_at'] = status['last_success_at']
-        github.put(STATUS_PATH, new, sha, 'Record feed refresh ' + ('failure ' + error if error else 'recovery'))
+                    recorded = None
+            if error is None:
+                if not (status and status.get('last_error')):
+                    return
+                if recorded is not None and snapshot_at is not None and recorded > snapshot_at:
+                    print('Status keeps a newer failure recorded by another run.')
+                    return
+            else:
+                current, _ = github.get(SNAPSHOT_PATH)
+                current_at = snapshot_time(current) if current else None
+                if current_at is not None and started is not None and current_at >= started:
+                    print('Failure not recorded: another run published a newer snapshot meanwhile.')
+                    return
+                if recorded is not None and recorded > now:
+                    print('Failure not recorded: a newer status already exists.')
+                    return
+            if put_status(github, status, sha, now, error, trigger, run_id, snapshot_at) == 'ok':
+                return
+        print('Could not record feed status: write conflict')
     except Exception as status_error:   # noqa: BLE001 - diagnostics must not hide the real result
         print('Could not record feed status:', error_code(status_error))
+
+
+def put_status(github, status, sha, now, error, trigger, run_id, snapshot_at):
+    """One write of data/feed-status.json; returns 'ok' or 'conflict'."""
+    failures = 0
+    if error is not None:
+        failures = 1
+        if status and status.get('last_error'):
+            try:
+                failures = int(status.get('consecutive_failures', 0)) + 1
+            except (TypeError, ValueError):
+                failures = 1
+    new = {'schema': 1, 'last_attempt_at': now.isoformat(), 'last_error': error or '',
+           'consecutive_failures': failures, 'trigger': trigger, 'run_id': run_id}
+    if error is None:
+        new['last_success_at'] = (snapshot_at or now).isoformat()
+    elif status and status.get('last_success_at'):
+        new['last_success_at'] = status['last_success_at']
+    return github.put(STATUS_PATH, new, sha, 'Record feed refresh ' + ('failure ' + error if error else 'recovery'))
 
 
 def run(argv, github, fetch, now=utcnow, env=None, sleep=time.sleep):
@@ -277,11 +316,12 @@ def run(argv, github, fetch, now=utcnow, env=None, sleep=time.sleep):
         if age < dt.timedelta(minutes=args.if_older_than):
             print('Skip: published snapshot is %.0f min old (limit %.0f).' % (age.total_seconds() / 60, args.if_older_than))
             return 0
+    started = now()
     try:
         fetched_at, text, source_updated, entries = fetch_validated(fetch, now, sleep=sleep)
     except Exception as error:   # noqa: BLE001
         code = error_code(error)
-        record_status(github, now(), code, trigger, run_id)
+        record_status(github, now(), code, trigger, run_id, started=started)
         print('FAILED:', code, '- the previous snapshot stays published unchanged.')
         return 1
     digest = content_digest(entries)
@@ -291,10 +331,10 @@ def run(argv, github, fetch, now=utcnow, env=None, sleep=time.sleep):
         return 0
     snapshot = build_snapshot(previous, text, source_updated, entries, fetched_at, digest, trigger, run_id)
     try:
-        result = publish(github, snapshot, previous, sha, 'Refresh public film feed snapshot')
+        result = publish(github, snapshot, previous, sha, 'Refresh public film feed snapshot', entries)
     except Exception as error:   # noqa: BLE001
         code = error_code(error)
-        record_status(github, now(), code, trigger, run_id)
+        record_status(github, now(), code, trigger, run_id, started=started)
         print('FAILED:', code)
         return 1
     print(result.capitalize() + ':', len(entries), 'entries; fetched_at', snapshot['fetched_at'],
