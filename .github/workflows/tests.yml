@@ -5,7 +5,7 @@ on:
   push:
     branches: [main]
     # Feed/metadata bot commits touch only data/; run on code changes.
-    paths: ['**.ps1', '**.cs', '**.cmd', 'tests/**', '.github/workflows/tests.yml']
+    paths: ['**.ps1', '**.cs', '**.cmd', '**.py', 'tests/**', '.github/workflows/**']
 permissions:
   contents: read
 concurrency:
@@ -41,3 +41,13 @@ jobs:
         run: |
           & .\tests\Run-All.ps1
           exit $LASTEXITCODE
+  python:
+    name: Python feed mirror scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Run unit tests (fakes only; no RuTracker or GitHub API calls)
+        run: python3 -m unittest discover -s tests -p 'test_*.py' -v

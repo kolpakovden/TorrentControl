@@ -7,7 +7,7 @@
     else {[IO.File]::Move("$full.tmp",$full)}
 }
 function Get-AutoErrorCode($Exception) {
-    $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
+    $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
     if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
@@ -70,18 +70,47 @@ function ConvertTo-AutoTime($Value) {
     if ([DateTimeOffset]::TryParse([string]$Value,[Globalization.CultureInfo]::InvariantCulture,[Globalization.DateTimeStyles]::AssumeUniversal,[ref]$parsed)) {return $parsed}
     return $null
 }
-function Get-AutoBudget($Rows, $Paths, [double]$FreeBytes, [double]$ReserveBytes) {
-    $remaining=0.0
-    foreach ($row in $Rows) {
-        if ($row.Count -lt 19) {throw 'UnsupportedRow'}
-        if ([double]$row[4] -ge 1000) {continue}
+function ConvertTo-AutoBytes($Value) {
+    # Whole non-negative number as [decimal] (exact, no NaN); $null for missing, text, fractions or absurd values.
+    if ($null -eq $Value -or $Value -is [bool] -or $Value -is [string]) {return $null}
+    if (!($Value -is [int] -or $Value -is [long] -or $Value -is [decimal] -or $Value -is [double])) {return $null}
+    $number=[double]$Value
+    if ([double]::IsNaN($number) -or [double]::IsInfinity($number) -or $number -lt 0 -or $number -gt 9.0e18) {return $null}
+    $exact=[decimal]$Value
+    if ($exact -ne [decimal]::Truncate($exact)) {return $null}
+    return $exact
+}
+function Get-AutoBudget($Rows, $Paths, $FreeBytes, $ReserveBytes) {
+    # Bytes on D: that a new torrent may use. All arithmetic in [decimal]; anything that prevents a safe
+    # estimate stops the addition (fail-closed).
+    $limit=[decimal]1125899906842624   # 1 PiB: no real torrent or counter on this PC is larger
+    $free=ConvertTo-AutoBytes $FreeBytes
+    if ($null -eq $free) {throw 'FreeSpaceUnknown'}
+    $reserve=ConvertTo-AutoBytes $ReserveBytes
+    if ($null -eq $reserve -or $reserve -lt [decimal]21474836480) {throw 'InvalidAutoSettings'}
+    $remaining=[decimal]0
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row -or $row -is [string] -or $row -isnot [Collections.IList] -or $row.Count -lt 19) {throw 'UnsupportedRow'}
+        $progress=ConvertTo-AutoBytes $row[4]
+        $left=ConvertTo-AutoBytes $row[18]
+        # Complete only when PROGRESS and REMAINING agree. DOWNLOADED is a traffic counter: torrents added
+        # with existing data stay at 0, long seeds exceed SIZE; it never decides completeness.
+        if ($null -ne $progress -and $null -ne $left -and $progress -eq 1000 -and $left -eq 0) {continue}
         $path=Get-AutoPath $row $Paths
-        if (!$path) {throw 'UnknownIncompletePath'}
+        if ($path -notmatch '^[A-Za-z]:\\') {throw 'UnknownIncompletePath'}
         if ($path -notmatch '^D:\\') {continue}
-        if ([double]$row[3] -le 0 -or [double]$row[5] -lt 0 -or [double]$row[18] -lt 0) {throw 'UnknownRemainingSize'}
-        $remaining += [math]::Max([double]$row[18], [math]::Max(0.0,[double]$row[3]-[double]$row[5]))
+        $size=ConvertTo-AutoBytes $row[3]
+        $done=ConvertTo-AutoBytes $row[5]
+        if ($null -eq $size -or $null -eq $done -or $null -eq $progress -or $null -eq $left -or $size -le 0 -or
+            $size -gt $limit -or $done -gt $limit -or $left -gt $limit -or $progress -gt 1000) {throw 'UnknownRemainingSize'}
+        # Largest of three independent estimates, so one wrong counter cannot hide missing data.
+        $need=[math]::Max($left,[math]::Max([decimal]0,$size-$done))
+        $need=[math]::Max($need,[decimal]::Ceiling($size*(1000-$progress)/1000))
+        $remaining+=$need
     }
-    return [math]::Max(0.0,$FreeBytes-$ReserveBytes-$remaining)
+    $budget=$free-$reserve-$remaining
+    if ($budget -lt 0) {return [decimal]0}
+    return $budget
 }
 function Get-AutoFreeBytes {
     $drive=New-Object IO.DriveInfo('D:\')

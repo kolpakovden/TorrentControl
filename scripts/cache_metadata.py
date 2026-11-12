@@ -19,6 +19,22 @@ def eligible(title):
             and not re.search(r'(?i)\b(CAM(?:Rip)?|HDCAM|HDTS|TS|TC)\b', title))
 
 
+MAX_FEED_AGE = dt.timedelta(days=14)
+
+
+def feed_age_hours(feed, now):
+    """Hours since the snapshot was fetched.
+
+    Metadata needs only the hash list, so a stale but genuine snapshot is still used: an outage of the
+    feed must not stop caching for topics already queued by clients (it used to fail the job after 6 h).
+    Snapshots from the future or older than the feed window (about two weeks) are refused.
+    """
+    age = now - dt.datetime.fromisoformat(feed['fetched_at'])
+    if age < -dt.timedelta(minutes=5) or age > MAX_FEED_AGE:
+        raise ValueError('feed stale')
+    return age.total_seconds() / 3600
+
+
 def decode_metadata(raw, expected):
     if len(raw) > 4_000_000:
         raise ValueError('metadata too large')
@@ -68,7 +84,7 @@ def decode_metadata(raw, expected):
 
 def main():
     repo = os.environ['GITHUB_REPOSITORY']
-    headers = {'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'TorrentControl/1.7'}
+    headers = {'Authorization': 'Bearer '+os.environ['GH_TOKEN'], 'Accept': 'application/vnd.github+json', 'User-Agent': 'TorrentControl/1.8'}
     api = 'https://api.github.com/repos/'+repo+'/contents/'
 
     def get(path):
@@ -87,9 +103,9 @@ def main():
             raise
 
     feed, _ = get('data/forum-252.json')
-    age = dt.datetime.now(dt.timezone.utc)-dt.datetime.fromisoformat(feed['fetched_at'])
-    if age.total_seconds() > 21600 or age.total_seconds() < -300:
-        raise ValueError('feed stale')
+    hours = feed_age_hours(feed, dt.datetime.now(dt.timezone.utc))
+    if hours > 6:
+        print('Warning: feed snapshot is %.1f h old; caching continues for its entries.' % hours)
     ns = {'a': 'http://www.w3.org/2005/Atom'}
     root = ET.fromstring(feed['xml'])
     if root.findtext('a:id', namespaces=ns) != 'tag:rto.feed,2000:/f/252':

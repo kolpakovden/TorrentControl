@@ -9,9 +9,19 @@ try {
     $script:rows = @(); $script:paths = @{}; $script:autoCalls = 0; $script:feedEntries = @()
     function Import-Clixml { return [pscustomobject]@{} }
     function Fetch-List { return (ConvertTo-WebUIList $script:rows) }
-    function Collect-Films { param($TorrentRows, $Directory) $script:LatestFilmEntries = $script:feedEntries; return 0 }
+    $script:feedFails = $false; $script:autoEntries = -1
+    function Collect-Films {
+        param($TorrentRows, $Directory)
+        if ($script:feedFails) {
+            $script:LatestFilmEntries = $null
+            $script:FeedDiagnostics = [pscustomobject]@{ fetchedAt = [DateTimeOffset]::UtcNow.AddHours(-8); ageHours = 8 }
+            throw 'MirrorStaleOver6Hours'
+        }
+        $script:LatestFilmEntries = $script:feedEntries; return 0
+    }
+    function Get-FeedMirrorStatus { return $null }
     function Read-LocalPaths { return $script:paths }
-    function Invoke-AutoLoad { $script:autoCalls++; return 'stub' }
+    function Invoke-AutoLoad { $script:autoCalls++; $script:autoEntries = @($args[0]).Count; return 'stub' }
     function Invoke-WebRequest { throw 'Network access is not allowed in tests' }
     $statePath = "$temp\state.json"
     function Read-State { return (Get-Content -LiteralPath $statePath -Raw -Encoding UTF8 | ConvertFrom-Json) }
@@ -42,6 +52,21 @@ try {
     Collect
     Assert (Test-Path -LiteralPath "$statePath.bak") 'previous state kept as .bak'
     Assert ((Get-Record $h1).firstSeen -eq $firstSeen) 'history continues'
+
+    # --- Feed stale or unavailable: the autoload queue keeps running, no new topics are added ------
+    $script:feedFails = $true
+    $calls = $script:autoCalls
+    Collect
+    Assert ($script:autoCalls -eq $calls + 1 -and $script:autoEntries -eq 0) 'autoload queue stopped while the feed was stale'
+    $html = Get-FileText "$temp\report.html"
+    Assert ($html -match 'MirrorStaleOver6Hours' -and $html -match 'возраст 8' -and $html -match 'новые темы не добавляются') 'stale feed reason not reported'
+    Assert ((Get-FileText "$temp\monitor.log") -match 'FEED ERROR: .*MirrorStaleOver6Hours.*snapshotAgeHours=8') 'stale feed not logged with its age'
+    Assert ((Get-Record $h1).firstSeen -eq $firstSeen) 'stale feed changed history'
+    $script:feedFails = $false
+    $script:feedEntries = @([pscustomobject]@{ topic = '900000001' })
+    Collect
+    Assert ($script:autoEntries -eq 1 -and $script:autoCalls -eq $calls + 2) 'feed entries not passed after recovery'
+    $script:feedEntries = @()
     $before = Get-FileText $statePath
     $calls = $script:autoCalls
 
