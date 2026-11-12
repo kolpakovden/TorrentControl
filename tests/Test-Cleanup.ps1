@@ -54,8 +54,9 @@ $low = Invoke-Seeding @(0.8, 0.5, 0.9)
 $d = Decide $low
 Assert ($d.decision -eq 'Кандидат на очистку') "0.8/0.5/0.9 GiB: $($d.decision) / $($d.reason)"
 # Upper bounds: never below the true amount, below 1 GiB here.
-Assert ($d.day1 -ge 0.8 * $GiB -and $d.day1 -lt $GiB -and $d.day2 -ge 0.5 * $GiB -and $d.day3 -ge 0.9 * $GiB -and $d.day3 -lt $GiB) "bounds $($d.day1) $($d.day2) $($d.day3)"
-Assert ($d.total72 -ge 2.2 * $GiB -and $d.total72 -lt 2.4 * $GiB) "72 h total $($d.total72)"
+# (Test amounts are floored to whole bytes, hence the one-byte tolerance.)
+Assert ($d.day1 -ge 0.8 * $GiB - 1 -and $d.day1 -lt $GiB -and $d.day2 -ge 0.5 * $GiB - 1 -and $d.day3 -ge 0.9 * $GiB - 1 -and $d.day3 -lt $GiB) "bounds $($d.day1) $($d.day2) $($d.day3)"
+Assert ($d.total72 -ge 2.2 * $GiB - 1 -and $d.total72 -lt 2.4 * $GiB) "72 h total $($d.total72)"
 
 $busy = Decide (Invoke-Seeding @(0.8, 1.2, 0.4))
 Assert ($busy.decision -eq 'Оставить' -and $busy.reason -match 'сутки 2' -and $busy.day2 -ge 1.2 * $GiB) "0.8/1.2/0.4 GiB: $($busy.decision) / $($busy.reason)"
@@ -113,6 +114,14 @@ foreach ($p in @('C:\Seed\Film', 'E:\Archive\Film')) {
 }
 $f = Decide (Invoke-Seeding @(0, 0, 0) -Path 'F:\Seed\Film')
 Assert ($f.decision -eq 'Кандидат на очистку') 'F: torrent not allowed in Dry Run'
+
+# Absent from the list, back with an unknown path, then measurable again: the history starts again.
+$other = New-TestRow (New-TestHash 'c') 'D:\Other\Film'
+$m1 = Merge-History @(,$other) @{} $zero.items ($Eval + 900)
+$m2 = Merge-History @($other, (New-TestRow $hash -Fields 19 -Size (40 * $GiB) -Uploaded (Get-Uploaded $Eval @(0, 0, 0)))) @{} @($m1.items) ($Eval + 1800)
+$m3 = Merge-History @($other, (New-TestRow $hash 'D:\Seed\Film' -Size (40 * $GiB) -Uploaded (Get-Uploaded $Eval @(0, 0, 0)))) @{} @($m2.items) ($Eval + 2700)
+$back = @($m3.observed | Where-Object { $_.state.hash -eq $hash })[0]
+Assert ($back.state.uploadNote -eq 'Missing' -and (Get-CleanupDecision $back ($Eval + 2700)).decision -eq 'Недостаточно данных') 'torrent that left the list kept its upload history'
 
 # Observation shorter than 30 days.
 $young = Invoke-Seeding @(0, 0, 0)

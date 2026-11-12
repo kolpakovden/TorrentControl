@@ -1,8 +1,8 @@
-﻿function Save-AutoJson($Value, [string]$Path) {
+﻿function Save-AutoJson($Value, [string]$Path, [switch]$Compress) {
     $full=$ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)
-    $Value | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath "$full.tmp" -Encoding UTF8
+    $Value | ConvertTo-Json -Depth 12 -Compress:$Compress | Set-Content -LiteralPath "$full.tmp" -Encoding UTF8
     # File.Replace keeps the previous version as .bak and never leaves a moment without the file;
-    # Move-Item -Force deletes the target first, so a crash there used to lose the journal/history.
+    # a forced move would replace the target non-atomically, so a crash there used to lose the journal/history.
     if ([IO.File]::Exists($full)) {[IO.File]::Replace("$full.tmp",$full,"$full.bak")}
     else {[IO.File]::Move("$full.tmp",$full)}
 }
