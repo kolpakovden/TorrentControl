@@ -9,9 +9,58 @@ Assert (!(Test-AutoTitle 'Film WEB-DL Original Eng + Sub Rus')) 'subtitles accep
 $hA = New-TestHash 'a'; $hB = New-TestHash 'b'
 $rows = @((New-TestRow $hA 'D:\old' -Size 100GB -Progress 400 -Downloaded 40GB), (New-TestRow $hB 'F:\old' -Size 100GB -Progress 0))
 Assert ((Get-AutoBudget $rows @{} 340GB 20GB) -eq 260GB) 'unfinished D reservation'
-Assert-Throws { Get-AutoBudget @(,(New-TestRow $hA '' -Size 1GB -Progress 0)) @{} 10GB 0 } 'UnknownIncompletePath' 'unknown path did not block'
+Assert-Throws { Get-AutoBudget @(,(New-TestRow $hA '' -Size 1GB -Progress 0)) @{} 10GB 20GB } 'UnknownIncompletePath' 'unknown path did not block'
 Assert ((Get-AutoBudget @(,(New-TestRow $hA -Fields 19 -Size 10GB -Progress 0)) @{ $hA = 'D:\x' } 100GB 20GB) -eq 70GB) '2.2.1 rows use resume.dat path'
-Assert-Throws { Get-AutoBudget @(,@($hA, 1)) @{} 1GB 0 } 'UnsupportedRow' 'short row accepted'
+Assert-Throws { Get-AutoBudget @(,@($hA, 1)) @{} 1GB 20GB } 'UnsupportedRow' 'short row accepted'
+
+# --- Budget for drive D: (1.8: consistent completeness, exact arithmetic, fail-closed) -------------
+function Budget($Rows, $Paths = @{}, $Free = 200GB, $Reserve = 20GB) { return (Get-AutoBudget @($Rows) $Paths $Free $Reserve) }
+# PROGRESS=1000 but REMAINING>0 and DOWNLOADED<SIZE: data is still missing and must be reserved.
+Assert ((Budget @(,(New-TestRow $hA 'D:\Фильмы\rt-1\Film' -Size 100GB -Progress 1000 -Downloaded 60GB -Remaining 40GB))) -eq 140GB) 'PROGRESS=1000 with REMAINING>0 not reserved'
+Assert ((Budget @(,(New-TestRow $hA 'F:\Film' -Size 100GB -Progress 1000 -Downloaded 60GB -Remaining 40GB))) -eq 180GB) 'F: download used the D: reserve'
+# Normal uTorrent 2.2.1 seeds: added from existing data (DOWNLOADED=0) or long seeded; never reserved, path not needed.
+Assert ((Budget @(,(New-TestRow $hA 'D:\Keeper\Film' -Size 100GB -Progress 1000 -Downloaded 0 -Remaining 0))) -eq 180GB) 'complete torrent with DOWNLOADED=0 reserved'
+Assert ((Budget @(,(New-TestRow $hA -Fields 19 -Size 100GB -Progress 1000 -Downloaded 0 -Remaining 0))) -eq 180GB) 'complete torrent without a known path blocked'
+Assert ((Budget @(,(New-TestRow $hA 'D:\Keeper\Film' -Size 10GB -Progress 1000 -Downloaded 5TB -Remaining 0))) -eq 180GB) 'long-seeded complete torrent reserved'
+# REMAINING=0 while PROGRESS shows half missing and DOWNLOADED>=SIZE: the progress share is reserved.
+Assert ((Budget @(,(New-TestRow $hA 'D:\x' -Size 100GB -Progress 500 -Downloaded 200GB -Remaining 0))) -eq 130GB) 'contradictory REMAINING=0 not reserved'
+# REMAINING slightly above SIZE (piece boundaries): the larger value is reserved, not rejected.
+Assert ((Budget @(,(New-TestRow $hA 'D:\x' -Size 10GB -Progress 0 -Downloaded 0 -Remaining (10GB + 4MB)))) -eq (170GB - 4MB)) 'REMAINING above SIZE'
+# Several downloads on D: add up; F:, E: and complete torrents do not.
+$many = @(
+    (New-TestRow (New-TestHash '1') 'D:\a' -Size 20GB -Progress 500 -Downloaded 10GB),
+    (New-TestRow (New-TestHash '2') 'D:\b' -Size 30GB -Progress 500 -Downloaded 15GB),
+    (New-TestRow (New-TestHash '3') 'd:\c' -Size 10GB -Progress 500 -Downloaded 5GB),
+    (New-TestRow (New-TestHash '4') 'F:\d' -Size 500GB -Progress 0),
+    (New-TestRow (New-TestHash '5') 'E:\e' -Size 500GB -Progress 0),
+    (New-TestRow (New-TestHash '6') 'D:\f' -Size 900GB -Progress 1000))
+Assert ((Budget $many) -eq 150GB) 'several incomplete torrents on D:'
+# No free space, exact bytes and rounding.
+Assert ((Budget @(,(New-TestRow $hA 'D:\x' -Size 10GB -Progress 0)) -Free 15GB) -eq 0) 'free space below the reserve'
+Assert ((Budget @() -Free 0) -eq 0) 'empty drive'
+Assert ((Budget @() -Free (20GB + 58)) -eq 58) 'exact bytes above the reserve'
+Assert ((Budget @(,(New-TestRow $hA 'D:\x' -Size 1001 -Progress 999 -Downloaded 1001 -Remaining 0))) -eq (180GB - 2)) 'progress share must round up'
+$big = 9007199254740993L
+Assert ([decimal](Budget @() -Free $big) -eq ([decimal]$big - [decimal]20GB)) 'free space beyond 2^53 lost precision'
+# Fail-closed: the D: budget cannot be confirmed.
+$broken = @(
+    @{ i = 18; v = $null }, @{ i = 18; v = 'x' }, @{ i = 18; v = -1 }, @{ i = 18; v = [double]::NaN }, @{ i = 18; v = 1.5 },
+    @{ i = 18; v = [long][math]::Pow(2, 60) }, @{ i = 3; v = 0 }, @{ i = 3; v = [double]::PositiveInfinity }, @{ i = 5; v = $null },
+    @{ i = 4; v = 1001 }, @{ i = 4; v = $null }, @{ i = 4; v = '1000' })
+foreach ($c in $broken) {
+    $row = New-TestRow $hA 'D:\x' -Size 10GB -Progress 500 -Downloaded 5GB; $row[$c.i] = $c.v
+    Assert-Throws { Budget @(,$row) } 'UnknownRemainingSize' "field $($c.i)='$($c.v)' did not stop the budget"
+}
+$row = New-TestRow $hA 'F:\x' -Size 10GB -Progress 500 -Downloaded 5GB; $row[18] = $null
+Assert ((Budget @(,$row)) -eq 180GB) 'damaged F: torrent blocked the D: budget'
+foreach ($p in @('\\?\D:\Фильмы\x', '\\server\share\x', 'D:', 'Фильмы\x')) {
+    Assert-Throws { Budget @(,(New-TestRow $hA -Fields 19 -Size 10GB -Progress 0)) @{ $hA = $p } } 'UnknownIncompletePath' "path '$p' accepted"
+}
+Assert-Throws { Budget @() -Free ([double]::NaN) } 'FreeSpaceUnknown' 'NaN free space'
+Assert-Throws { Budget @() -Free -1 } 'FreeSpaceUnknown' 'negative free space'
+Assert-Throws { Budget @() -Free $null } 'FreeSpaceUnknown' 'missing free space'
+Assert-Throws { Budget @() -Reserve 10GB } 'InvalidAutoSettings' 'reserve below 20 GiB'
+Assert-Throws { Budget @() -Reserve ([double]::NaN) } 'InvalidAutoSettings' 'NaN reserve'
 foreach ($bad in @('E:\Archive', 'D:\Фильмы\..\Windows', 'D:\Фильмы\rt-1\sub', 'D:\Фильмы\rt-1x', 'D:\Other')) {
     Assert-Throws { Assert-AutoDirectory $bad } 'DestinationNotAllowed' "destination $bad allowed"
 }
@@ -205,6 +254,22 @@ try {
     Assert-Throws { Run-Auto $new } 'ClientDataInvalid:DuplicateHash' 'duplicate rows accepted'
     Assert ($script:launches.Count -eq $before) 'duplicate rows led to a submission'
 
+    # --- Space check on the list refreshed right before launch -------------------------------------------
+    $script:free = 100GB
+    Reset-AutoState
+    $script:freshRows = @($other, (New-TestRow (New-TestHash 'd') 'D:\Хранитель\Busy' -Size 100GB -Progress 1000 -Downloaded 15GB -Remaining 85GB))
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'NoSpace' -and $script:launches.Count -eq $before) 'PROGRESS=1000 with REMAINING>0 ignored before launch'
+    Reset-AutoState
+    $script:freshRows = @($other, (New-TestRow (New-TestHash 'd') 'D:\Manual\Big' -Size 90GB -Progress 0))
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'NoSpace' -and $script:launches.Count -eq $before) 'download started before launch ignored'
+    Reset-AutoState
+    $script:free = 19GB
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'NoSpace' -and $script:launches.Count -eq $before) 'free space below the reserve ignored'
+    $script:free = 100GB
+
     # --- Recovery after failures and restarts ----------------------------------------------------
     # Crash after "Submitted" was saved but before uTorrent got the command: never resent.
     Reset-AutoState @(New-Submitted 0.5)
@@ -267,7 +332,26 @@ try {
     Save-AutoJson @{ enabled = $true; destination = 'D:\Фильмы'; reserveGiB = 5 } (Join-Path $temp 'autoload.json')
     Assert-Throws { Run-Auto $new } 'InvalidAutoSettings' 'reserve under 20 GiB accepted'
 
+    # --- Space frees up: exactly one launch, no duplicate task afterwards -----------------------
+    Save-AutoJson @{ enabled = $true; destination = 'D:\Фильмы'; reserveGiB = 20 } (Join-Path $temp 'autoload.json')
+    $script:expectTopic = '900000002'
+    $script:meta = [pscustomobject]@{ schema = 1; hash = $hash; status = 'success'; total_bytes = 58; torrent_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture)) }
+    Reset-AutoState
+    $busyRow = New-TestRow (New-TestHash 'd') 'D:\Хранитель\Busy' -Size 100GB -Progress 100 -Downloaded 10GB
+    $script:clientRows = @($other, $busyRow)
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'NoSpace' -and $script:launches.Count -eq 2) 'busy drive accepted'
+    $script:clientRows = @($other, (New-TestRow (New-TestHash 'd') 'D:\Хранитель\Busy' -Size 100GB -Progress 1000 -Downloaded 100GB -Remaining 0))
+    $null = Run-Auto $new
+    Assert ($script:launches.Count -eq 3 -and (Get-AutoItem).status -eq 'Submitted') 'freed space did not resume the queue'
+    foreach ($poll in 1..2) { $null = Run-Auto $new }
+    Assert ($script:launches.Count -eq 3) 'duplicate torrent task after launch'
+    $script:clientRows = @($other, (New-TestRow $hash $ours -Size 58 -Progress 0))
+    $null = Run-Auto $new
+    $null = Run-Auto $new
+    Assert ($script:launches.Count -eq 3 -and (Get-AutoItem).status -eq 'Confirmed') 'confirmed torrent submitted again'
+
     Assert ($script:webCalls.Count -eq 0) "WebUI was called directly: $($script:webCalls -join '; ')"
-    Assert ($script:launches.Count -eq 2) "exactly two launches expected in the whole run, got $($script:launches.Count)"
+    Assert ($script:launches.Count -eq 3) "exactly three launches expected in the whole run, got $($script:launches.Count)"
 } finally { Remove-TestDirectory $temp }
 "PASS Test-AutoLoad: $script:AssertCount assertions"
