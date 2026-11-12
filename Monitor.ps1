@@ -54,22 +54,31 @@ function Collect {
     $feedMessage = 'Подборка фильмов не обновлена; подробности в monitor.log.'
     try {
         $feedCount = Collect-Films $torrents $root
-        $feedMessage = "Подборка фильмов обновлена: $feedCount записей."
+        $feedMessage = "Подборка фильмов обновлена: $feedCount записей. " + (Get-FeedSuccessSummary)
     } catch {
         $detail = Get-FeedErrorDetail $_.Exception
-        $feedMessage = "Подборка фильмов не обновлена: $detail."
+        $feedMessage = "Подборка фильмов не обновлена: $detail. " + (Get-FeedFailureSummary)
         Write-Host "Feed failed: $detail" -ForegroundColor Yellow
-        Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $detail. Torrent monitoring continues." -Encoding UTF8
+        $age = ''
+        if ($null -ne $script:FeedDiagnostics) { $age = "; snapshotAgeHours=$($script:FeedDiagnostics.ageHours)" }
+        Add-Content "$root\monitor.log" "$(Get-Date -Format s) FEED ERROR: $detail$age. Torrent monitoring continues." -Encoding UTF8
     }
     $localPaths = Read-LocalPaths
-    $autoMessage='Автозагрузка ждёт свежую ленту.'
+    $autoMessage=''
     # The whole WebUI response is checked strictly before autoload may submit anything.
     $listProblem = Get-TorrentListProblem $torrents
     if ($listProblem) {
         $autoMessage = "Автозагрузка не запускалась: µTorrent вернул некорректные данные ($listProblem). Новые раздачи не отправляются, пока список не станет корректным."
         Add-Content "$root\monitor.log" "$(Get-Date -Format s) AUTO SKIPPED: ClientDataInvalid:$listProblem" -Encoding UTF8
-    } elseif ($null -ne $script:LatestFilmEntries) {
-        try {$autoMessage=Invoke-AutoLoad $script:LatestFilmEntries $torrents $localPaths $config $credential $root}
+    } else {
+        # The queue (path confirmation, metadata retries, waiting for space) does not depend on the feed.
+        # Without a valid snapshot no new topics are added, so a stale feed only delays discovery.
+        $entries = @()
+        if ($null -ne $script:LatestFilmEntries) { $entries = $script:LatestFilmEntries }
+        try {
+            $autoMessage=Invoke-AutoLoad $entries $torrents $localPaths $config $credential $root
+            if ($null -eq $script:LatestFilmEntries) { $autoMessage = 'Лента не обновлена: новые темы не добавляются. ' + $autoMessage }
+        }
         catch {
             $autoMessage='Автозагрузка приостановлена из-за ошибки; см. monitor.log.'
             Add-Content "$root\monitor.log" "$(Get-Date -Format s) AUTO ERROR: $($_.Exception.GetType().Name); $(Get-AutoErrorCode $_.Exception)" -Encoding UTF8

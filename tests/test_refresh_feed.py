@@ -95,7 +95,7 @@ def run(github, raw=None, args=(), now=NOW, error=None, env=None):
 
     environment = {'GITHUB_EVENT_NAME': 'schedule', 'GITHUB_RUN_ID': '42'}
     environment.update(env or {})
-    code = rf.run(list(args), github=github, fetch=fetch, now=Clock(now), env=environment)
+    code = rf.run(list(args), github=github, fetch=fetch, now=Clock(now), env=environment, sleep=lambda seconds: None)
     return code, len(calls)
 
 
