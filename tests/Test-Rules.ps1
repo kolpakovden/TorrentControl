@@ -142,4 +142,45 @@ $lower = Old-Record ($h1.ToLowerInvariant()) (40*$day) (20*$day) 100
 $m = Merge-History @(,(New-TestRow $h1 $path -Uploaded 100)) @{} @($lower) $now
 Assert ((@($m.items)[0]).firstSeen -eq $lower.firstSeen) 'hash comparison is case-insensitive'
 
+# --- Strict validation of the whole list (gate before any autoload submission) -------------------
+Assert ((Get-TorrentListProblem @((New-TestRow $h1 $path), (New-TestRow $h2 'F:\x'))) -eq '') 'valid list'
+Assert ((Get-TorrentListProblem @()) -eq '') 'empty list has no corrupted values'
+Assert ((Get-TorrentListProblem @(,(New-TestRow 'zz' $path))) -eq 'Hash') 'bad hash'
+Assert ((Get-TorrentListProblem @((New-TestRow $h1 $path), (New-TestRow $h1 $path))) -eq 'DuplicateHash') 'duplicate hash'
+Assert ((Get-TorrentListProblem @(,@($h1, 1))) -eq 'Format') 'short row'
+$corruptions = @(
+    @{ i = 1; v = 'x'; code = 'Status' }, @{ i = 3; v = -1; code = 'Size' }, @{ i = 4; v = '1000'; code = 'Progress' },
+    @{ i = 5; v = $null; code = 'Downloaded' }, @{ i = 6; v = 1.5; code = 'Uploaded' }, @{ i = 8; v = 'fast'; code = 'UploadSpeed' },
+    @{ i = 12; v = -3; code = 'PeersConnected' }, @{ i = 18; v = $null; code = 'Remaining' })
+foreach ($c in $corruptions) {
+    $bad = New-TestRow $h1 $path -Uploaded 100; $bad[$c.i] = $c.v
+    Assert ((Get-TorrentListProblem @((New-TestRow $h2 'F:\Second' -Uploaded 200), $bad)) -eq $c.code) "field $($c.i) corruption not detected"
+    # A damaged list is not evidence that absent torrents were removed.
+    $m = Merge-History @(,$bad) @{} $previous $now
+    $absent = @($m.items | Where-Object hash -eq $h2)[0]
+    Assert ($absent -and [int]$absent.missingPolls -eq 0 -and $m.missing -eq 0 -and $m.invalid -eq 1) "field $($c.i) corruption increased missingPolls"
+    $self = @($m.items | Where-Object hash -eq $h1)[0]
+    Assert ($self.firstSeen -eq $previous[0].firstSeen -and $self.uploaded -eq 100) "field $($c.i) corruption reset the history of the damaged row"
+    # Fields 5, 8, 12 do not drive history resets: the row is still observed (8/12 as "not enough data").
+    if ($c.i -in @(8, 12)) { Assert (@($m.observed).Count -eq 1 -and !$self.knownPeers) "field $($c.i): row observed as 'not enough data'" }
+    elseif ($c.i -eq 5) { Assert (@($m.observed).Count -eq 1 -and $self.knownPeers) 'field 5: row observed normally' }
+    else { Assert (@($m.observed).Count -eq 0 -and $m.kept -ge 1) "field $($c.i): history kept unchanged" }
+}
+# The same damaged list for many polls and hours never drops absent history.
+$bad = New-TestRow $h1 $path -Uploaded 100; $bad[8] = 'fast'
+$state = @($previous)
+foreach ($step in 0..5) { $state = @((Merge-History @(,$bad) @{} $state ($now + $step * 3 * 3600)).items) }
+$absent = @($state | Where-Object hash -eq $h2)
+Assert ($absent.Count -eq 1 -and [int]$absent[0].missingPolls -eq 0) 'repeated damaged lists dropped history'
+# A torrent still listed in resume.dat is not counted as removed; absence from both sources is.
+$m = Merge-History @(,(New-TestRow $h2 'F:\Second' -Uploaded 200)) @{ $h1 = $path } $previous $now
+Assert ([int](@($m.items | Where-Object hash -eq $h1)[0]).missingPolls -eq 0 -and $m.missing -eq 0) 'torrent present in resume.dat counted as missing'
+$m = Merge-History @(,(New-TestRow $h2 'F:\Second' -Uploaded 200)) @{ $h2 = 'F:\Second' } $previous $now
+Assert ([int](@($m.items | Where-Object hash -eq $h1)[0]).missingPolls -eq 1 -and $m.missing -eq 1) 'absence confirmed by both sources must count'
+
+# --- Report values: invalid client data is labelled, never cast or shown as zero -----------------
+Assert ((Format-RowNumber 2048 1KB 1) -eq 2) 'number formatting'
+Assert ((Format-RowNumber 0 1KB 1) -eq 0) 'zero is a real value'
+foreach ($badValue in @($null, 'fast', '12', -1, 1.5, $true)) { Assert ((Format-RowNumber $badValue 1KB 1) -eq 'н/д') "value '$badValue' must be shown as unknown" }
+
 "PASS Test-Rules: $script:AssertCount assertions"

@@ -63,7 +63,12 @@ function Collect {
     }
     $localPaths = Read-LocalPaths
     $autoMessage='Автозагрузка ждёт свежую ленту.'
-    if ($null -ne $script:LatestFilmEntries) {
+    # The whole WebUI response is checked strictly before autoload may submit anything.
+    $listProblem = Get-TorrentListProblem $torrents
+    if ($listProblem) {
+        $autoMessage = "Автозагрузка не запускалась: µTorrent вернул некорректные данные ($listProblem). Новые раздачи не отправляются, пока список не станет корректным."
+        Add-Content "$root\monitor.log" "$(Get-Date -Format s) AUTO SKIPPED: ClientDataInvalid:$listProblem" -Encoding UTF8
+    } elseif ($null -ne $script:LatestFilmEntries) {
         try {$autoMessage=Invoke-AutoLoad $script:LatestFilmEntries $torrents $localPaths $config $credential $root}
         catch {
             $autoMessage='Автозагрузка приостановлена из-за ошибки; см. monitor.log.'
@@ -78,14 +83,14 @@ function Collect {
         $report += [pscustomobject]@{
             Решение = (Get-Decision $state $now); Признак_спроса = (Get-DemandLabel $state)
             Название = [string]$row[2]; Путь = $entry.path
-            ГБ = [math]::Round(([double]$row[3] / 1GB), 2)
-            Готово = ([double]$row[4] / 10)
+            ГБ = (Format-RowNumber $row[3] 1GB 2)
+            Готово = (Format-RowNumber $row[4] 10 1)
             Дней_хранения = [math]::Round(($now - $state.firstSeen) / 86400, 1)
             Дней_без_спроса = [math]::Round(($now - $state.quietSince) / 86400, 1)
             Отдано_за_наблюдение_МБ = [math]::Round($state.observedUpload / 1MB, 2)
-            Отдача_КБ_с = [math]::Round(([double]$row[8] / 1KB), 1)
-            Пиров_подключено = $row[12]; Сидов_подключено = $row[14]
-            Пиров_в_рое = $row[13]; Сидов_в_рое = $row[15]; Hash = $state.hash
+            Отдача_КБ_с = (Format-RowNumber $row[8] 1KB 1)
+            Пиров_подключено = (Format-RowNumber $row[12]); Сидов_подключено = (Format-RowNumber $row[14])
+            Пиров_в_рое = (Format-RowNumber $row[13]); Сидов_в_рое = (Format-RowNumber $row[15]); Hash = $state.hash
         }
     }
     $report = @($report | Sort-Object Решение, Название)
@@ -93,9 +98,9 @@ function Collect {
     $observedCount = @($merge.observed).Count
     $intro = "<h1>Монитор временных раздач</h1><p>Обновлено: $stamp · Мониторинг раздач; удаление отключено.</p><p>Раздач D/F: $observedCount. Другие диски: $($merge.excluded). Путь не определён: $($merge.unknown). Некорректные данные клиента: $($merge.invalid).</p>"
     $intro += '<p>Кандидат: 30 дней наблюдаемого хранения и 14 дней без замеченного спроса. Спросом считается только то, что видит наш клиент: прирост отдачи с прошлой проверки, текущая скорость отдачи или подключённые к нам пиры (не сиды). Перерыв в проверках более часа, остановка или ошибка сбрасывают период тишины.</p>'
-    $intro += '<p>Столбцы «Пиров_в_рое» и «Сидов_в_рое» — сведения о рое в целом (по данным трекера), а не о нашей раздаче; на решение они не влияют.</p>'
+    $intro += '<p>Столбцы «Пиров_в_рое» и «Сидов_в_рое» — сведения о рое в целом (по данным трекера), а не о нашей раздаче; на решение они не влияют. «н/д» — клиент не сообщил корректное значение.</p>'
     if ($merge.kept -gt 0 -or $merge.missing -gt 0) {
-        $intro += "<p>История сохранена без обновления: $($merge.kept) (путь временно не определён или данные некорректны). Нет в списке клиента: $($merge.missing) — история удаляется только после трёх подряд проверок без раздачи и не ранее чем через 6 часов.</p>"
+        $intro += "<p>История сохранена без обновления: $($merge.kept) (путь временно не определён, данные некорректны или отсутствие раздачи не подтверждено). Нет в списке клиента: $($merge.missing) — история удаляется только после трёх подряд проверок без раздачи и не ранее чем через 6 часов.</p>"
     }
     $style = '<meta charset="utf-8"><style>body{font:15px Segoe UI;margin:28px;background:#f5f7fa}table{border-collapse:collapse;background:white;width:100%}td,th{padding:9px;border:1px solid #ddd;text-align:left}th{background:#dfeafa}h1{color:#17365d}</style>'
     if ($merge.unknown -gt 0) {

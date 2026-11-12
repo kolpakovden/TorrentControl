@@ -1,4 +1,5 @@
 ﻿. "$PSScriptRoot\TestCommon.ps1"
+. "$PSScriptRoot\..\Rules.ps1"
 . "$PSScriptRoot\..\AutoLoad.ps1"
 
 # --- Pure helpers -------------------------------------------------------------------------------------
@@ -26,6 +27,8 @@ Assert ((ConvertTo-AutoTime '2026-10-24T00:00:00.0000000+00:00').ToUnixTimeSecon
 Assert ($null -eq (ConvertTo-AutoTime '')) 'empty time'
 Assert ((Get-AutoErrorCode ([Exception]::new('AutoStateBackupPresent'))) -eq 'AutoStateBackupPresent') 'error allowlist'
 Assert ((Get-AutoErrorCode ([Exception]::new('C:\secret\path'))) -eq 'SeeClientAndConfiguration') 'unknown errors hidden'
+Assert ((Get-AutoErrorCode ([Exception]::new('ClientDataInvalid:Progress'))) -eq 'ClientDataInvalid:Progress') 'data error code kept'
+Assert ((Get-AutoErrorCode ([Exception]::new('ClientDataInvalid:C:\x'))) -eq 'SeeClientAndConfiguration') 'only known data codes logged'
 
 $temp = New-TestDirectory
 try {
@@ -170,6 +173,37 @@ try {
     $requests = $script:metaRequests
     $message = Run-Auto $new
     Assert ($script:launches.Count -eq $before -and $script:metaRequests -eq $requests -and $message -match 'пустой список') 'empty client list used'
+
+    # --- Corrupted numeric values from WebUI: nothing is examined or submitted -------------------------
+    # Reference: a valid incomplete D: torrent reserves 85 GiB of 100 GiB free (minus 20 GiB reserve).
+    $busy = New-TestRow (New-TestHash 'd') 'D:\Хранитель\Busy' -Size 100GB -Progress 150 -Downloaded 15GB
+    Reset-AutoState
+    $script:clientRows = @($other, $busy)
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'NoSpace' -and $script:launches.Count -eq $before) 'reserve for incomplete torrents'
+    $corruptions = @(
+        @{ i = 4; v = '1000'; code = 'Progress' }, @{ i = 18; v = $null; code = 'Remaining' }, @{ i = 5; v = 'x'; code = 'Downloaded' },
+        @{ i = 3; v = -1; code = 'Size' }, @{ i = 0; v = 'not-a-hash'; code = 'Hash' }, @{ i = 12; v = 1.5; code = 'PeersConnected' },
+        @{ i = 8; v = $null; code = 'UploadSpeed' }, @{ i = 1; v = '201'; code = 'Status' })
+    foreach ($c in $corruptions) {
+        $bad = [object[]]$busy.Clone(); $bad[$c.i] = $c.v
+        $requests = $script:metaRequests
+        # In the first list: autoload stops before confirmation, metadata or submission.
+        Reset-AutoState
+        $script:clientRows = (ConvertTo-WebUIList @($other, $bad)).torrents
+        Assert-Throws { Run-Auto $new } ('ClientDataInvalid:' + $c.code) "field $($c.i) in the first list not rejected"
+        Assert ($script:launches.Count -eq $before -and $script:metaRequests -eq $requests -and (Get-AutoItem).status -eq 'WaitingMetadata') "field $($c.i) in the first list led to a submission attempt"
+        # In the list refreshed right before launch.
+        Reset-AutoState
+        $script:freshRows = (ConvertTo-WebUIList @($other, $bad)).torrents
+        Assert-Throws { Run-Auto $new } ('ClientDataInvalid:' + $c.code) "field $($c.i) in the refreshed list not rejected"
+        $item = Get-AutoItem
+        Assert ($script:launches.Count -eq $before -and $item.status -eq 'WaitingMetadata' -and $item.reason -eq 'ClientDataInvalid') "field $($c.i) in the refreshed list led to a submission"
+    }
+    Reset-AutoState
+    $script:clientRows = @($other, $other)
+    Assert-Throws { Run-Auto $new } 'ClientDataInvalid:DuplicateHash' 'duplicate rows accepted'
+    Assert ($script:launches.Count -eq $before) 'duplicate rows led to a submission'
 
     # --- Recovery after failures and restarts ----------------------------------------------------
     # Crash after "Submitted" was saved but before uTorrent got the command: never resent.

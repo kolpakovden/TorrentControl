@@ -26,6 +26,33 @@ function Get-HistoryRowProblem($Row) {
     if (!(Test-RowInteger $Row[18])) { return 'Remaining' }
     return ''
 }
+function Get-TorrentRowProblem($Row) {
+    # Strict check of every numeric field the monitor or autoload reads.
+    $problem = Get-HistoryRowProblem $Row
+    if ($problem) { return $problem }
+    if (!(Test-RowInteger $Row[5])) { return 'Downloaded' }
+    if (!(Test-RowInteger $Row[8])) { return 'UploadSpeed' }
+    if (!(Test-RowInteger $Row[12])) { return 'PeersConnected' }
+    return ''
+}
+function Get-TorrentListProblem($Rows) {
+    # Whole-response check before autoload may act: one damaged row makes the response untrusted.
+    $seen = @{}
+    foreach ($row in @($Rows)) {
+        if ($null -eq $row -or $row -is [string] -or $row -isnot [Collections.IList] -or $row.Count -lt 19) { return 'Format' }
+        $problem = Get-TorrentRowProblem $row
+        if ($problem) { return $problem }
+        $hash = ([string]$row[0]).ToUpperInvariant()
+        if ($seen.ContainsKey($hash)) { return 'DuplicateHash' }
+        $seen[$hash] = $true
+    }
+    return ''
+}
+function Format-RowNumber($Value, [double]$Divisor = 1, [int]$Digits = 0) {
+    # Report helper: an invalid or missing client value is shown as "н/д", never as 0 and never as an error.
+    if (!(Test-RowInteger $Value)) { return 'н/д' }
+    return [math]::Round([double]$Value / $Divisor, $Digits)
+}
 function Assert-TorrentRows($Rows) {
     foreach ($row in @($Rows)) {
         if ($null -eq $row -or $row -is [string] -or $row -isnot [Collections.IList] -or $row.Count -lt 19) { throw 'UnsupportedRowFormat' }
@@ -83,8 +110,9 @@ function Copy-HistoryRecord($Old, [int]$MissingPolls, [long]$MissingSince) {
 function Merge-History($Rows, $LocalPaths, $PreviousItems, [long]$Now, [int]$DropPolls = 3, [long]$DropSeconds = 21600) {
     # Builds the next state.json. Temporary failures keep the previous record unchanged:
     # unknown path (resume.dat not readable), invalid values, unparseable rows.
-    # A torrent absent from a complete list is kept for DropPolls consecutive polls spanning
-    # DropSeconds before its history is discarded as a real removal.
+    # A torrent counts as absent only when every row of the list is intact and resume.dat does not
+    # list it either; it is then kept for DropPolls consecutive polls spanning DropSeconds before its
+    # history is discarded as a real removal.
     $previous = @{}
     foreach ($item in @($PreviousItems)) {
         if ($null -ne $item -and (Test-TorrentHash ([string]$item.hash))) { $previous[([string]$item.hash).ToUpperInvariant()] = $item }
@@ -103,8 +131,10 @@ function Merge-History($Rows, $LocalPaths, $PreviousItems, [long]$Now, [int]$Dro
         $seen[$hash] = $true
         $old = $null
         if ($previous.ContainsKey($hash)) { $old = $previous[$hash] }
+        # Any corrupted value makes the response suspect: absence of other torrents proves nothing.
+        if (Get-TorrentRowProblem $row) { $invalid++; $complete = $false }
         $path = ''
-        if (Get-HistoryRowProblem $row) { $invalid++ } else {
+        if (!(Get-HistoryRowProblem $row)) {
             $path = Get-HistoryPath $row $LocalPaths
             if (!$path) { $unknown++ }
         }
@@ -124,8 +154,8 @@ function Merge-History($Rows, $LocalPaths, $PreviousItems, [long]$Now, [int]$Dro
     foreach ($hash in @($previous.Keys)) {
         if ($seen.ContainsKey($hash)) { continue }
         $old = $previous[$hash]
-        if (!$complete) {
-            # Some rows could not be identified: absence is not evidence of removal.
+        if (!$complete -or ($LocalPaths -and $LocalPaths.ContainsKey($hash))) {
+            # Damaged list, or uTorrent still lists the torrent in resume.dat: absence is not evidence of removal.
             [void]$items.Add((Copy-HistoryRecord $old ([int]$old.missingPolls) ([long]$old.missingSince))); $kept++
             continue
         }

@@ -71,10 +71,35 @@ try {
 
     # --- Partial list: absent torrent kept for the grace period, not reported ----------------------
     $script:rows = @(,(New-TestRow $h1 'D:\Хранитель\One' -Uploaded 100))
+    $script:paths = @{}
     Collect
     $two = Get-Record $h2
     Assert ($two -and $two.missingPolls -eq 1) 'absent torrent kept with missing counter'
+    # Still listed in resume.dat: absence is not confirmed, the counter does not grow.
+    $script:paths = @{ $h2 = 'F:\Two' }
+    Collect
+    Assert ((Get-Record $h2).missingPolls -eq 1) 'torrent present in resume.dat counted as missing'
+    $script:paths = @{}
     Assert (@(Import-Csv -LiteralPath "$temp\report.csv" -Delimiter ';' -Encoding UTF8 | Where-Object Hash -eq $h2).Count -eq 0) 'absent torrent not reported'
+
+    # --- Corrupted numeric values: autoload skipped before any submission, history kept, report safe ---
+    $calls = $script:autoCalls
+    $bad = New-TestRow $h1 'D:\Хранитель\One' -Uploaded 100; $bad[8] = 'fast'; $bad[12] = $null
+    $script:rows = @(,$bad)
+    Collect
+    Assert ($script:autoCalls -eq $calls) 'autoload ran on corrupted client data'
+    Assert ((Get-FileText "$temp\monitor.log") -match 'AUTO SKIPPED: ClientDataInvalid:UploadSpeed') 'skipped autoload logged with a code'
+    Assert ((Get-FileText "$temp\report.html") -match 'Автозагрузка не запускалась: .{1,12}Torrent вернул некорректные данные \(UploadSpeed\)') 'report explains skipped autoload'
+    $one = @(Import-Csv -LiteralPath "$temp\report.csv" -Delimiter ';' -Encoding UTF8 | Where-Object Hash -eq $h1)[0]
+    Assert ($one.Отдача_КБ_с -eq 'н/д' -and $one.Пиров_подключено -eq 'н/д') 'unknown values labelled, not shown as 0'
+    Assert ($one.Решение -eq 'Недостаточно данных / остановлена') 'corrupted peers are not evidence of no demand'
+    Assert ((Get-Record $h1).firstSeen -eq $firstSeen -and (Get-Record $h2).missingPolls -eq 1) 'damaged list changed history'
+    # Progress that looks complete as a string: the row keeps its history, autoload stays off.
+    $bad = New-TestRow $h1 'D:\Хранитель\One' -Uploaded 100 -Progress 500; $bad[4] = '1000'
+    $script:rows = @(,$bad)
+    Collect
+    Assert ($script:autoCalls -eq $calls) 'autoload ran on corrupted progress'
+    Assert ((Get-Record $h1).firstSeen -eq $firstSeen -and (Get-Record $h2).missingPolls -eq 1) 'corrupted progress changed history'
 
     # --- Corrupted state.json: stop, keep the file for inspection --------------------------------
     Set-Content -LiteralPath $statePath -Value '{"version":1,"items":[{"hash"' -Encoding UTF8

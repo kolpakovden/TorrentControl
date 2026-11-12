@@ -9,6 +9,7 @@
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
+    if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
 }
 function Get-AutoRemoteJson([string]$Uri) {
@@ -118,6 +119,7 @@ function Write-AutoReport($State,[string]$Directory) {
         LaunchFailed='Не удалось запустить µTorrent для передачи. Повторная передача не выполняется.'
         FoundInResumeDat='Найдено в resume.dat µTorrent'
         ClientListUnstable='Список µTorrent изменился во время проверки; повтор при следующем опросе'
+        ClientDataInvalid='µTorrent вернул некорректные данные; отправка отложена до корректного списка'
     }
     $rows=@($State.items | ForEach-Object {
         $reason=[string]$_.reason
@@ -128,6 +130,7 @@ function Write-AutoReport($State,[string]$Directory) {
     $rows | ConvertTo-Html -Head '<meta charset="utf-8"><style>body{font:15px Segoe UI;margin:24px}td,th{border:1px solid #ddd;padding:8px}table{border-collapse:collapse}</style>' -PreContent $intro | Set-Content "$Directory\auto-downloads.html" -Encoding UTF8
 }
 function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Directory) {
+    # Requires Rules.ps1 (Get-TorrentListProblem); Monitor.ps1 loads it first.
     $settingsPath=Join-Path $Directory 'autoload.json'
     if (!(Test-Path -LiteralPath $settingsPath)) {return 'Автозагрузка выключена.'}
     $settings=Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8 | ConvertFrom-Json
@@ -151,6 +154,9 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
     $state.knownTopics=@($known.Keys)
     Save-AutoJson $state $statePath
     try {
+        # Nothing is confirmed or submitted from a response with corrupted values.
+        $problem=Get-TorrentListProblem $Rows
+        if ($problem) {throw "ClientDataInvalid:$problem"}
         $exe=Assert-AutoLocalClient $Config
         Assert-AutoDirectory $settings.destination
         $now=[DateTimeOffset]::UtcNow
@@ -202,6 +208,8 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
             # Refresh before mutation: includes any manual additions since the monitor started.
             $fresh=Fetch-List $Config $Credential
             $freshRows=@($fresh.torrents)
+            $problem=Get-TorrentListProblem $freshRows
+            if ($problem) {$item.reason='ClientDataInvalid';throw "ClientDataInvalid:$problem"}
             $Paths=Read-LocalPaths
             $presence=Get-AutoPresence $freshRows $Paths $item.hash
             if ($presence) {$item.status='Existing';$item.reason=$(if($presence -eq 'ResumeDat'){'FoundInResumeDat'}else{''});continue}
