@@ -332,8 +332,29 @@ try {
     Save-AutoJson @{ enabled = $true; destination = 'D:\Фильмы'; reserveGiB = 5 } (Join-Path $temp 'autoload.json')
     Assert-Throws { Run-Auto $new } 'InvalidAutoSettings' 'reserve under 20 GiB accepted'
 
-    # --- Space frees up: exactly one launch, no duplicate task afterwards -----------------------
+    # --- Feed recovery after missed updates: each topic queued once, nothing duplicated --------------
     Save-AutoJson @{ enabled = $true; destination = 'D:\Фильмы'; reserveGiB = 20 } (Join-Path $temp 'autoload.json')
+    $script:meta = [pscustomobject]@{ schema = 1; hash = ''; status = 'unavailable' }
+    Reset-AutoState
+    function New-FeedItem($Topic, $Hash, $Title = 'Film WEB-DL Dub') { [pscustomobject]@{ topic = [string]$Topic; hash = $Hash; title = $Title } }
+    $window1 = @((New-FeedItem 900000101 ('1' * 40)), (New-FeedItem 900000102 ('2' * 40)), (New-FeedItem 900000103 ('3' * 40)))
+    $null = Run-Auto $window1
+    Assert (@((Read-AutoState).items).Count -eq 3) 'first window not queued'
+    # Several polls while the feed is stale (queue only), then the snapshot after an 11-hour gap.
+    foreach ($poll in 1..3) { $null = Run-Auto @() }
+    Assert (@((Read-AutoState).items).Count -eq 3) 'queue-only polls changed the queue'
+    $window2 = @((New-FeedItem 900000104 ('4' * 40)), (New-FeedItem 900000105 ('5' * 40)), (New-FeedItem 900000101 ('9' * 40)),
+        (New-FeedItem 900000102 ('2' * 40)), (New-FeedItem 900000103 ('3' * 40)), (New-FeedItem 900000106 ('2' * 40) 'Repost WEB-DL Dub'))
+    $null = Run-Auto $window2
+    $queued = @((Read-AutoState).items)
+    Assert ($queued.Count -eq 5) "recovered window: expected 5 queued topics, got $($queued.Count)"
+    Assert (@($queued | Where-Object topic -eq '900000101')[0].hash -eq ('1' * 40)) 'hash change of a processed topic queued a new download'
+    Assert (@($queued | Where-Object hash -eq ('2' * 40)).Count -eq 1) 'same release under a new topic queued twice'
+    $null = Run-Auto $window2
+    $null = Run-Auto $window1
+    Assert (@((Read-AutoState).items).Count -eq 5 -and $script:launches.Count -eq 2) 'repeated or older window duplicated topics or tasks'
+
+    # --- Space frees up: exactly one launch, no duplicate task afterwards -----------------------
     $script:expectTopic = '900000002'
     $script:meta = [pscustomobject]@{ schema = 1; hash = $hash; status = 'success'; total_bytes = 58; torrent_base64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes($fixture)) }
     Reset-AutoState
