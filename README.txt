@@ -3,7 +3,7 @@ TORRENTCONTROL 1.7
 ОБНОВЛЕНИЕ
 Замените исходные файлы в C:\TorrentMonitor.
 Сохраните config.json, credential.xml, state.json, feed-state.json,
-а также autoload.json и auto-state.json, если они уже существуют.
+а также autoload.json, auto-state.json и файлы *.json.bak, если они уже существуют.
 1-Setup.cmd повторно запускать не нужно.
 
 АВТОЗАГРУЗКА
@@ -20,7 +20,8 @@ TORRENTCONTROL 1.7
 report.html — основной отчёт; films.html — подборка;
 auto-downloads.html — журнал автозагрузки; monitor.log — ошибки.
 После отправки новое задание ожидает подтверждения пути; повторно не отправляется.
-При статусе «Нужна проверка» проверьте задание в µTorrent. Не стирайте auto-state.json.
+При статусе «Нужна проверка» проверьте задание в µTorrent, затем запустите
+8-Review-autoload.cmd. Не стирайте auto-state.json. Автозагрузка не останавливает раздачи.
 
 Удаление отключено. D:/F: отслеживаются; E: архив и C: система исключены из отбора.
 WebTLO и общие настройки µTorrent не меняются.

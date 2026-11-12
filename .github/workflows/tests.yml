@@ -1,0 +1,43 @@
+name: PowerShell tests
+on:
+  pull_request:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    # Feed/metadata bot commits touch only data/; run on code changes.
+    paths: ['**.ps1', '**.cs', '**.cmd', 'tests/**', '.github/workflows/tests.yml']
+permissions:
+  contents: read
+concurrency:
+  group: powershell-tests-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  windows:
+    name: Windows ${{ matrix.name }}
+    runs-on: windows-latest
+    timeout-minutes: 15
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: PowerShell 5.1
+            shell: powershell
+            major: 5
+          - name: PowerShell 7
+            shell: pwsh
+            major: 7
+    defaults:
+      run:
+        shell: ${{ matrix.shell }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Check PowerShell version
+        run: |
+          $PSVersionTable | Format-Table -AutoSize | Out-String | Write-Host
+          if ($PSVersionTable.PSVersion.Major -ne ${{ matrix.major }}) { throw "Expected PowerShell ${{ matrix.major }}" }
+      - name: Run tests (stubs only; no uTorrent, WebUI or downloads)
+        run: |
+          & .\tests\Run-All.ps1
+          exit $LASTEXITCODE
