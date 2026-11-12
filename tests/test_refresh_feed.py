@@ -49,6 +49,9 @@ class FakeGitHub:
         self.puts = []
         self.conflicts = 0
         self.on_conflict = None
+        # One-shot hooks: run another "workflow" right before this read or write of a path.
+        self.before_get = {}
+        self.before_put = {}
         for path, obj in (files or {}).items():
             self.store(path, obj)
 
@@ -57,12 +60,18 @@ class FakeGitHub:
         self.files[path] = (json.loads(json.dumps(obj)), 'sha%d' % self.counter)
 
     def get(self, path):
+        hook = self.before_get.pop(path, None)
+        if hook:
+            hook(self)
         if path not in self.files:
             return None, None
         obj, sha = self.files[path]
         return copy.deepcopy(obj), sha
 
     def put(self, path, obj, sha, message):
+        hook = self.before_put.pop(path, None)
+        if hook:
+            hook(self)
         if self.conflicts:
             self.conflicts -= 1
             if self.on_conflict:
@@ -84,18 +93,31 @@ class Clock:
         return self.now
 
 
-def run(github, raw=None, args=(), now=NOW, error=None, env=None):
+class SteppingClock:
+    """Time moves on between calls, like a real run that retries for a while."""
+    def __init__(self, start, step):
+        self.start, self.step, self.calls = start, step, 0
+
+    def __call__(self):
+        value = self.start + self.calls * self.step
+        self.calls += 1
+        return value
+
+
+def run(github, raw=None, args=(), now=NOW, error=None, env=None, clock=None, fetch_hook=None):
     calls = []
 
     def fetch():
         calls.append(1)
+        if fetch_hook:
+            fetch_hook()
         if error is not None:
             raise error
         return raw
 
     environment = {'GITHUB_EVENT_NAME': 'schedule', 'GITHUB_RUN_ID': '42'}
     environment.update(env or {})
-    code = rf.run(list(args), github=github, fetch=fetch, now=Clock(now), env=environment, sleep=lambda seconds: None)
+    code = rf.run(list(args), github=github, fetch=fetch, now=clock or Clock(now), env=environment, sleep=lambda seconds: None)
     return code, len(calls)
 
 
@@ -273,6 +295,83 @@ class Failures(NoNetwork):
         github = FakeGitHub()
         run(github, error=ValueError('https://secret.example/?token=abc body'))
         self.assertEqual(github.get(rf.STATUS_PATH)[0]['last_error'], 'Unexpected=ValueError')
+
+
+class Concurrency(NoNetwork):
+    """Two runs (refresh-feed and the cache-metadata backup trigger) racing on the same files."""
+
+    def test_newer_run_recomputes_diagnostics_after_conflict(self):
+        github = FakeGitHub()
+        run(github, feed(NOW))                                        # S0, read by both A and B
+        t_a = NOW + dt.timedelta(days=20)
+        t_b = t_a + dt.timedelta(hours=1)
+        # A publishes between B's read and B's write, so B's write conflicts and B rereads A.
+        github.before_put[rf.SNAPSHOT_PATH] = lambda gh: run(gh, feed(t_a, oldest_age_hours=48), now=t_a, env={'GITHUB_RUN_ID': 'A'})
+        code, _ = run(github, feed(t_b, count=6, oldest_age_hours=48), now=t_b, env={'GITHUB_RUN_ID': 'B'})
+        self.assertEqual(code, 0)
+        s = snapshot(github)
+        self.assertEqual((s['run_id'], s['sequence'], s['entry_count']), ('B', 3, 6))
+        # Everything that depends on the previous snapshot is relative to A, not to S0.
+        self.assertEqual(dt.datetime.fromisoformat(s['previous_fetched_at']), t_a)
+        self.assertEqual(s['gap_hours'], 1.0)
+        self.assertEqual(s['coverage'], 'contiguous')                 # relative to S0 it would be possible_gap
+        self.assertEqual(dt.datetime.fromisoformat(s['oldest_entry_updated']), t_b - dt.timedelta(hours=48))
+        self.assertEqual([p for p, _ in github.puts].count(rf.SNAPSHOT_PATH), 3)
+
+    def test_older_run_overwrites_nothing_after_conflict(self):
+        github = FakeGitHub()
+        run(github, feed(NOW))
+        t_b = NOW + dt.timedelta(hours=1)
+        t_a = NOW + dt.timedelta(hours=2)
+        github.before_put[rf.SNAPSHOT_PATH] = lambda gh: run(gh, feed(t_a, count=7), now=t_a, env={'GITHUB_RUN_ID': 'A'})
+        code, _ = run(github, feed(t_b, count=6), now=t_b, env={'GITHUB_RUN_ID': 'B'})
+        self.assertEqual(code, 0)
+        s = snapshot(github)
+        self.assertEqual((s['run_id'], s['sequence'], s['entry_count']), ('A', 2, 7))
+        self.assertEqual([p for p, _ in github.puts].count(rf.SNAPSHOT_PATH), 2)
+        self.assertIsNone(github.get(rf.STATUS_PATH)[0])
+
+    def test_late_failure_does_not_mark_a_newer_success_as_failed(self):
+        github = FakeGitHub()
+        run(github, feed(NOW))
+        t_b = NOW + dt.timedelta(hours=1)                              # B starts trying
+        t_a = t_b + dt.timedelta(minutes=2)                           # A fetches successfully meanwhile
+        started = []
+
+        def a_succeeds_while_b_retries():
+            if not started:
+                started.append(1)
+                run(github, feed(t_a, count=6), now=t_a, env={'GITHUB_RUN_ID': 'A'})
+        error = urllib.error.HTTPError(rf.SOURCE, 503, 'unavailable', {}, None)
+        code, _ = run(github, error=error, clock=SteppingClock(t_b, dt.timedelta(minutes=5)),
+                      fetch_hook=a_succeeds_while_b_retries, env={'GITHUB_RUN_ID': 'B'})
+        self.assertEqual(code, 1)                                     # B itself did fail
+        self.assertEqual(snapshot(github)['run_id'], 'A')
+        status = github.get(rf.STATUS_PATH)[0]
+        self.assertTrue(status is None or status['last_error'] == '', status)
+
+    def test_late_success_does_not_clear_a_newer_failure(self):
+        github = FakeGitHub()
+        run(github, feed(NOW))
+        run(github, error=urllib.error.HTTPError(rf.SOURCE, 503, 'unavailable', {}, None), now=NOW + dt.timedelta(hours=1))
+        t_a = NOW + dt.timedelta(hours=2)
+        t_b = t_a + dt.timedelta(minutes=3)
+        # A succeeds; before A clears the old error, B (started after A's fetch) fails and records a newer one.
+        github.before_get[rf.STATUS_PATH] = lambda gh: run(gh, error=urllib.error.URLError('down'), now=t_b, env={'GITHUB_RUN_ID': 'B'})
+        code, _ = run(github, feed(t_a, count=6), now=t_a, env={'GITHUB_RUN_ID': 'A'})
+        self.assertEqual(code, 0)
+        self.assertEqual(snapshot(github)['run_id'], 'A')
+        status = github.get(rf.STATUS_PATH)[0]
+        self.assertEqual((status['last_error'], status['run_id']), ('UpstreamNetwork=URLError', 'B'))
+        self.assertEqual(dt.datetime.fromisoformat(status['last_attempt_at']), t_b)
+
+    def test_genuine_failure_after_a_success_is_recorded(self):
+        github = FakeGitHub()
+        run(github, feed(NOW))
+        later = NOW + dt.timedelta(minutes=50)
+        self.assertEqual(run(github, error=urllib.error.URLError('down'), now=later)[0], 1)
+        status = github.get(rf.STATUS_PATH)[0]
+        self.assertEqual((status['last_error'], status['consecutive_failures']), ('UpstreamNetwork=URLError', 1))
 
 
 class CacheFeedAge(NoNetwork):
