@@ -42,7 +42,7 @@ function ConvertTo-TrackerText($Tiers) {
     return (@(foreach ($tier in @($Tiers)) { (@($tier) -join "`r`n") }) -join "`r`n`r`n")
 }
 function Get-TrackerClass([string]$Text) {
-    $lines = Get-TrackerLines $Text
+    $lines = @(Get-TrackerLines $Text)
     if (!$lines.Count) { return [pscustomobject]@{ kind = 'Unexpected'; host = '' } }
     $public = 0; $hostName = ''
     foreach ($line in $lines) {

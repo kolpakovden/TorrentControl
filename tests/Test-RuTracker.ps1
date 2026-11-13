@@ -150,6 +150,7 @@ try {
             default { return [pscustomobject]@{ status = 200; contentType = 'application/x-bittorrent'; bytes = (Read-Bytes $answer) } }
         }
     }
+    # Callers wrap the result in @(): Windows PowerShell 5.1 unrolls a one-element array and a lone object has no Count.
     function Get-Calls([string]$Kind) { return @($script:http | Where-Object { ($Kind -eq 'login') -eq ($_.url -like '*login.php') }) }
 
     # Login: verified form, cp1251, no automatic retry.
@@ -212,29 +213,25 @@ try {
     Reset-Login
     $script:route.dl = @('loginpage', $site); $script:route.login = 'ok'
     $result = Get-PersonalTorrent $dir $topic $siteHash
-    if ($script:http.Count -ne 3 -or (Get-Calls 'login').Count -ne 1) {
-        Write-Host ('DIAG count=' + $script:http.Count + ' logins=' + (Get-Calls 'login').Count + ' state=' + (Get-FileText (Join-Path $dir 'rutracker-state.json')))
-        foreach ($c in $script:http) { Write-Host ('DIAG call ' + $c.method + ' ' + $c.url) }
-    }
-    Assert ($script:http.Count -eq 3 -and (Get-Calls 'login').Count -eq 1 -and $result.host -eq 'bt2.rutracker.cx') 'expired session not renewed once'
+    Assert ($script:http.Count -eq 3 -and @(Get-Calls 'login').Count -eq 1 -and $result.host -eq 'bt2.rutracker.cx') 'expired session not renewed once'
     Assert ($script:storedSession -match 'bb_session=0-FAKE-NEW-SESSION-9') 'renewed session not stored'
     Assert ((Read-RuTrackerState $dir).loginAt -gt 0 -and !(Read-RuTrackerState $dir).blocked) 'login time not recorded'
     # A second expiry right after a login: no new login (throttle), the record waits.
     $script:route.dl = 'loginpage'; $script:http.Clear()
     Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerAuthExpired' 'expired session after a fresh login'
-    Assert ((Get-Calls 'login').Count -eq 0) 'automatic login repeated within the pause'
+    Assert (@(Get-Calls 'login').Count -eq 0) 'automatic login repeated within the pause'
     # Fresh login still gives an HTML page instead of a file: reported, no loop.
     Reset-Login
     $script:route.dl = 'loginpage'; $script:route.login = 'ok'
     Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerAuthExpired' 'HTML after login accepted'
-    Assert ((Get-Calls 'login').Count -eq 1) 'more than one automatic login'
+    Assert (@(Get-Calls 'login').Count -eq 1) 'more than one automatic login'
     # CAPTCHA or refusal: one attempt, then blocked without any request until Setup-RuTracker.ps1.
     foreach ($case in @(@('captcha', 'RuTrackerCaptchaRequired'), @('wrong', 'RuTrackerLoginFailed'))) {
         Reset-Login
         $script:storedSession = ''
         $script:route.login = $case[0]
         Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } $case[1] "$($case[0]) not reported"
-        Assert ((Get-Calls 'login').Count -eq 1 -and (Get-Calls 'dl').Count -eq 0) "$($case[0]): retried or downloaded"
+        Assert (@(Get-Calls 'login').Count -eq 1 -and @(Get-Calls 'dl').Count -eq 0) "$($case[0]): retried or downloaded"
         $script:http.Clear(); $script:route.login = 'ok'
         Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } $case[1] "$($case[0]) did not block"
         Assert ($script:http.Count -eq 0) "$($case[0]): requests while blocked"
@@ -251,7 +248,7 @@ try {
         Reset-Login
         $script:route.dl = $case[0]
         Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } $case[1] "download case $($case[1])"
-        Assert ((Get-Calls 'login').Count -eq 0) "$($case[1]) caused a login"
+        Assert (@(Get-Calls 'login').Count -eq 0) "$($case[1]) caused a login"
     }
     Reset-Login
     Assert-Throws { Get-PersonalTorrent $dir 'abc' $siteHash } 'RuTrackerTopicUnavailable' 'bad topic id requested'
