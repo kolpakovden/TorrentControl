@@ -212,7 +212,11 @@ try {
     Reset-Login
     $script:route.dl = @('loginpage', $site); $script:route.login = 'ok'
     $result = Get-PersonalTorrent $dir $topic $siteHash
-    Assert ($script:http.Count -eq 3 -and (Get-Calls 'login').Count -eq 1 -and $result.host -eq 'bt2.rutracker.cx') ("expired session not renewed once: host=" + $result.host + ' calls=' + (@($script:http | ForEach-Object { $_.method + ' ' + $_.url }) -join ', '))
+    if ($script:http.Count -ne 3 -or (Get-Calls 'login').Count -ne 1) {
+        Write-Host ('DIAG count=' + $script:http.Count + ' logins=' + (Get-Calls 'login').Count + ' state=' + (Get-FileText (Join-Path $dir 'rutracker-state.json')))
+        foreach ($c in $script:http) { Write-Host ('DIAG call ' + $c.method + ' ' + $c.url) }
+    }
+    Assert ($script:http.Count -eq 3 -and (Get-Calls 'login').Count -eq 1 -and $result.host -eq 'bt2.rutracker.cx') 'expired session not renewed once'
     Assert ($script:storedSession -match 'bb_session=0-FAKE-NEW-SESSION-9') 'renewed session not stored'
     Assert ((Read-RuTrackerState $dir).loginAt -gt 0 -and !(Read-RuTrackerState $dir).blocked) 'login time not recorded'
     # A second expiry right after a login: no new login (throttle), the record waits.
