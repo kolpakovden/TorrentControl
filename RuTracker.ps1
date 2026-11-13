@@ -32,7 +32,7 @@ $script:RuTrackerRouteOkAt = $null
 $script:RuTrackerRouteOkFor = $null
 $script:RuTrackerLastRoute = $null
 $script:RuTrackerCodes = @('RuTrackerNotConfigured','RuTrackerCredentialUnreadable','RuTrackerProxyInvalid','PersonalTrackersUnexpected',
-    'RuTrackerProxyUnavailable','RuTrackerTlsFailed','RuTrackerBlocked','RuTrackerRedirectRefused','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
+    'RuTrackerProxyUnavailable','RuTrackerTlsFailed','RuTrackerBlocked','RuTrackerRedirectRefused','PersonalImportInvalid','PersonalTopicMismatch','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
     'RuTrackerUnavailable','RuTrackerTopicUnavailable','PersonalTorrentInvalid','PersonalHashMismatch','PersonalAnnounceMissing','LocalAppDataMissing')
 
 function Add-RuTrackerSecret([string]$Value) { if ($Value -and $Value.Length -ge 4 -and !$script:RuTrackerSecrets.Contains($Value)) { $script:RuTrackerSecrets.Add($Value) } }
@@ -61,6 +61,26 @@ function Get-PersonalTorrentDirectory {
     # Inside the Windows user profile, not next to the scripts: the files contain the personal announce key.
     if (!$env:LOCALAPPDATA) { throw 'LocalAppDataMissing' }
     return (Join-Path $env:LOCALAPPDATA 'TorrentControl\personal')
+}
+function Protect-PersonalTorrentDirectory([string]$Folder) {
+    # Windows: access for the current user only (no inherited entries); new files inherit it. Nothing else changes.
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT) { return }
+    $user = [Security.Principal.WindowsIdentity]::GetCurrent().User
+    $current = Get-Acl -LiteralPath $Folder
+    $rules = @($current.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($current.AreAccessRulesProtected -and $rules.Count -eq 1 -and $rules[0].IdentityReference -eq $user -and
+        $rules[0].FileSystemRights -eq [Security.AccessControl.FileSystemRights]::FullControl) { return }
+    $acl = New-Object Security.AccessControl.DirectorySecurity
+    $acl.SetAccessRuleProtection($true, $false)
+    $acl.AddAccessRule((New-Object Security.AccessControl.FileSystemAccessRule($user, [Security.AccessControl.FileSystemRights]::FullControl,
+        ([Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'), [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow)))
+    Set-Acl -LiteralPath $Folder -AclObject $acl
+}
+function Initialize-PersonalTorrentDirectory {
+    $folder = Get-PersonalTorrentDirectory
+    if (!(Test-Path -LiteralPath $folder)) { $null = New-Item -Path $folder -ItemType Directory -Force }
+    Protect-PersonalTorrentDirectory $folder
+    return $folder
 }
 
 # --- Announce analysis -----------------------------------------------------------------------------------
@@ -108,9 +128,10 @@ function Get-TorrentTrackerInfo([string]$Path) {
     $set = Get-TrackerSetInfo @(foreach ($tier in $tiers) { foreach ($url in @($tier)) { [string]$url } })
     [pscustomobject]@{ tiers = $tiers; host = $set.host; personal = $set.personal; public = $set.public; other = $set.other }
 }
-function Test-PersonalTorrent([string]$Path, [string]$ExpectedHash) {
+function Test-PersonalTorrent([string]$Path, [string]$ExpectedHash, [string]$Topic = '') {
     # Same infohash as the feed, valid file list, at least one personal RuTracker announce, and nothing else
     # except the neutral retracker: a public RuTracker or a foreign tracker in the file stops (fail-closed).
+    # With -Topic, a file whose comment names another topic is refused too.
     if (!('TorrentMetadata' -as [type])) { Add-Type -Path "$PSScriptRoot\TorrentMetadata.cs" }
     $size = 0L
     try { $size = [TorrentMetadata]::Verify($Path, $ExpectedHash) }
@@ -122,7 +143,38 @@ function Test-PersonalTorrent([string]$Path, [string]$ExpectedHash) {
     try { $trackers = Get-TorrentTrackerInfo $Path } catch { throw 'PersonalTorrentInvalid' }
     if ($trackers.personal -lt 1) { throw 'PersonalAnnounceMissing' }
     if ($trackers.public -or $trackers.other) { throw 'PersonalTrackersUnexpected' }
+    if ($Topic) {
+        $named = ''
+        try { $named = [TorrentMetadata]::CommentTopic($Path) } catch { throw 'PersonalTorrentInvalid' }
+        if ($named -and $named -ne $Topic) { throw 'PersonalTopicMismatch' }
+    }
     [pscustomobject]@{ size = $size; host = $trackers.host; tiers = $trackers.tiers }
+}
+function Get-PersonalTorrentPath([string]$Hash) {
+    if ($Hash -notmatch '^[0-9A-Fa-f]{40}$') { throw 'PersonalTorrentInvalid' }
+    return (Join-Path (Get-PersonalTorrentDirectory) ($Hash.ToUpperInvariant() + '.torrent'))
+}
+function Save-PersonalTorrentBytes([byte[]]$Bytes, [string]$Hash, [string]$Topic = '') {
+    # The only way a personal .torrent is stored: the original bytes, verified before they replace anything.
+    # A file that fails is wiped (zero length) and never becomes <HASH>.torrent.
+    $null = Initialize-PersonalTorrentDirectory
+    $final = $ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Get-PersonalTorrentPath $Hash))
+    $temp = $final + '.tmp'
+    [IO.File]::WriteAllBytes($temp, $Bytes)
+    try { $null = Test-PersonalTorrent $temp $Hash $Topic } catch { [IO.File]::WriteAllBytes($temp, [byte[]]@()); throw }
+    if ([IO.File]::Exists($final)) { [IO.File]::Replace($temp, $final, [NullString]::Value) } else { [IO.File]::Move($temp, $final) }
+    $checked = Test-PersonalTorrent $final $Hash $Topic
+    [pscustomobject]@{ path = $final; host = $checked.host; tiers = $checked.tiers; size = $checked.size }
+}
+function Get-ImportedPersonalTorrent([string]$Hash, [string]$Topic = '') {
+    # A stored personal .torrent for this hash (imported from Firefox or downloaded earlier), checked again on every
+    # use: same infohash, personal announce only, same topic. $null if there is none; a file that fails is never
+    # used and never replaced by a network download silently (PersonalImportInvalid: import it again).
+    $path = Get-PersonalTorrentPath $Hash
+    if (![IO.File]::Exists($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path))) { return $null }
+    $checked = $null
+    try { $checked = Test-PersonalTorrent $path $Hash $Topic } catch { throw 'PersonalImportInvalid' }
+    [pscustomobject]@{ path = $path; host = $checked.host; tiers = $checked.tiers; size = $checked.size; source = 'Local' }
 }
 
 # --- Route and HTTP --------------------------------------------------------------------------------------
@@ -332,7 +384,10 @@ function Invoke-RuTrackerLogin($Credential, $Captcha = $null, [string]$CaptchaCo
     if ($Captcha -and $CaptchaCode) { $form += '&cap_sid=' + (ConvertTo-FormValue $Captcha.sid) + '&' + $Captcha.field + '=' + (ConvertTo-FormValue $CaptchaCode) }
     $response = Invoke-RuTrackerHttp 'Post' ($script:RuTrackerForum + 'login.php') $Session $form
     if ($response.status -eq 0) { throw (Get-RuTrackerFailureCode ([string]$response.error)) }
-    if ($response.status -eq 429) { throw 'RuTrackerBlocked' }
+    if ($response.status -in @(403, 429)) { throw 'RuTrackerBlocked' }
+    if ($response.status -eq 407) { throw 'RuTrackerProxyUnavailable' }
+    # Only the login page (200) or its redirect (302/303) can mean a refused password; anything else is not one.
+    if ($response.status -notin @(200, 302, 303)) { throw 'RuTrackerUnavailable' }
     if (Test-RuTrackerLoggedIn $Session) {
         foreach ($cookie in $Session.Cookies.GetCookies([Uri]$script:RuTrackerForum)) { Add-RuTrackerSecret $cookie.Value }
         return [pscustomobject]@{ ok = $true; session = $Session; captcha = $null }
@@ -397,6 +452,9 @@ function Get-RuTrackerTorrentBytes($Session, [string]$Topic) {
 }
 function Get-PersonalTorrent([string]$Directory, [string]$Topic, [string]$Hash) {
     # Fail-closed: any problem is a fixed code; a public version is never returned instead.
+    # A verified local file (imported from Firefox) is used first: no network, no credential, no cookie.
+    $local = Get-ImportedPersonalTorrent $Hash $Topic
+    if ($null -ne $local) { return $local }
     $script:RuTrackerProxy = Resolve-RuTrackerProxy $Directory
     $state = Read-RuTrackerState $Directory
     if ($state.blocked) { throw $state.blocked }
@@ -425,10 +483,6 @@ function Get-PersonalTorrent([string]$Directory, [string]$Topic, [string]$Hash) 
         Save-RuTrackerSessionText $Directory (Get-SessionCookieText $login.session)
         $bytes = Get-RuTrackerTorrentBytes $login.session $Topic
     }
-    $folder = Get-PersonalTorrentDirectory
-    if (!(Test-Path -LiteralPath $folder)) { $null = New-Item -Path $folder -ItemType Directory -Force }
-    $path = Join-Path $folder ($Hash.ToUpperInvariant() + '.torrent')
-    [IO.File]::WriteAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path), $bytes)
-    $checked = Test-PersonalTorrent $path $Hash
-    [pscustomobject]@{ path = $path; host = $checked.host; tiers = $checked.tiers; size = $checked.size }
+    $saved = Save-PersonalTorrentBytes $bytes $Hash $Topic
+    [pscustomobject]@{ path = $saved.path; host = $saved.host; tiers = $saved.tiers; size = $saved.size; source = 'RuTracker' }
 }

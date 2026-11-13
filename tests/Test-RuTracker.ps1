@@ -236,9 +236,17 @@ try {
     function Save-RuTrackerSessionText([string]$Directory, [string]$CookieText) { $script:storedSession = $CookieText }
     $dir = Join-Path $temp 'app'
     $null = Microsoft.PowerShell.Management\New-Item -Path $dir -ItemType Directory
+    function Clear-Personal {
+        # A stored personal file is used before the network (imports): network cases start without one.
+        $folder = Join-Path $env:LOCALAPPDATA 'TorrentControl\personal'
+        if ($env:LOCALAPPDATA -and (Microsoft.PowerShell.Management\Test-Path -LiteralPath $folder)) {
+            Microsoft.PowerShell.Management\Get-ChildItem -LiteralPath $folder -File | Microsoft.PowerShell.Management\Remove-Item -Force
+        }
+    }
     function Reset-Login([long]$LoginAt = 0) {
         Save-AutoJson ([ordered]@{ version = 1; blocked = ''; checkedAt = ''; loginAt = $LoginAt; host = '' }) (Join-Path $dir 'rutracker-state.json')
         $script:http.Clear()
+        Clear-Personal
     }
     $topic = '6612345'
     $site = Join-Path $src 'personal-6.torrent'   # bt2.rutracker.cx with a pk key and two tiers
@@ -257,9 +265,15 @@ try {
     Assert ((Get-TestSha1 (Read-Bytes $result.path)) -eq (Get-TestSha1 (Read-Bytes $site))) 'site file not saved byte for byte'
     Assert ($result.path -like "$($env:LOCALAPPDATA)*" -and $result.path -notlike "$dir*") 'personal torrent not in the Windows profile folder'
     Assert ($script:proxySeen -eq '') 'proxy used without rutracker-proxy.txt'
+    # A stored verified file is used without any request (the same file was just downloaded and stored).
+    $script:http.Clear(); $calls = $script:routeCalls
+    $again = Get-PersonalTorrent $dir $topic $siteHash
+    Assert ($again.source -eq 'Local' -and $again.path -eq $expectedPath -and $script:http.Count -eq 0 -and $script:routeCalls -eq $calls) 'stored personal file not used offline'
+    Clear-Personal
     [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $dir 'rutracker-proxy.txt')), 'http://127.0.0.1:8118')
     $null = Get-PersonalTorrent $dir $topic $siteHash
     Assert ($script:proxySeen -eq 'http://127.0.0.1:8118') 'configured proxy not used'
+    Clear-Personal
     [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath((Join-Path $dir 'rutracker-proxy.txt')), 'socks5://127.0.0.1:1080')
     $script:http.Clear()
     Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerProxyInvalid' 'invalid proxy file ignored'
@@ -274,7 +288,7 @@ try {
     Assert ($script:storedSession -match 'bb_session=0-FAKE-NEW-SESSION-9') 'renewed session not stored'
     Assert ((Read-RuTrackerState $dir).loginAt -gt 0 -and !(Read-RuTrackerState $dir).blocked) 'login time not recorded'
     # A second expiry right after a login: no new login (throttle), the record waits.
-    $script:route.dl = 'loginpage'; $script:http.Clear()
+    $script:route.dl = 'loginpage'; $script:http.Clear(); Clear-Personal
     Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerAuthExpired' 'expired session after a fresh login'
     Assert (@(Get-Calls 'login').Count -eq 0) 'automatic login repeated within the pause'
     # Fresh login still gives an HTML page instead of a file: reported, no loop.

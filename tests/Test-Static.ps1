@@ -46,6 +46,8 @@ foreach ($file in $production) {
     }
     Assert ($text -notmatch 'api\.github\.com') "$($file.Name): the local client never writes to GitHub"
     if ($file.Name -ne 'RuTracker.ps1') {
+        # PersonalImport.ps1 only shows the download link to the person (opened in Firefox), it never requests it.
+        if ($file.Name -eq 'PersonalImport.ps1') { $text = $text.Replace("download = 'https://rutracker.org/forum/dl.php?t=' + `$Topic", '') }
         Assert ($text -notmatch "(?i)'Post'|-Method\s+Post|login\.php|dl\.php|login_password") "$($file.Name) talks to RuTracker outside RuTracker.ps1"
     }
 }
@@ -82,6 +84,26 @@ $diagnostics = [IO.File]::ReadAllText((Join-Path $repo 'Test-RuTrackerConnection
 foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Import-Clixml', 'Invoke-RuTrackerLogin', 'Get-PersonalTorrent', 'Invoke-RuTrackerHttp', 'Start-Process', 'Stop-Process', 'Set-Content', 'Out-File')) {
     Assert ($diagnostics -notmatch $pattern) "Test-RuTrackerConnection.ps1 must stay anonymous and read-only: '$pattern'"
 }
+
+# --- Import of personal .torrent files and the Dry Run: offline, read-only for uTorrent and C:\TorrentMonitor -----
+foreach ($name in @('PersonalImport.ps1', 'Import-PersonalTorrent.ps1', 'Test-PersonalMigration.ps1')) {
+    $text = [regex]::Replace([IO.File]::ReadAllText((Join-Path $repo $name)), '(?m)^\s*#.*$', '')
+    foreach ($pattern in @('Invoke-RuTrackerHttp', 'Invoke-RuTrackerRouteCheck', 'Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Invoke-RuTrackerLogin',
+        'Get-PersonalTorrent\s', 'setprops', 'Export-Clixml', 'Set-Content', 'Out-File', 'Add-Content', 'Save-AutoJson', 'Start-Process', 'Set-Acl', 'Invoke-WebRequest')) {
+        Assert ($text -notmatch $pattern) "$name must stay offline and read-only: '$pattern'"
+    }
+    foreach ($write in [regex]::Matches($text, '\[IO\.File\]::Write\w+\(([^,]+)')) {
+        Assert ($write.Groups[1].Value -match '^\(Join-Path \$(ReportDirectory|PSScriptRoot) ') "$name writes outside its report folder: $($write.Value)"
+    }
+}
+$check = [IO.File]::ReadAllText((Join-Path $repo 'Test-PersonalMigration.ps1'))
+Assert ($check -match [regex]::Escape("function Set-WebUITrackers { throw 'ReadOnlyViolation' }") -and $check -match [regex]::Escape("function Invoke-TrackerMigration { throw 'ReadOnlyViolation' }")) 'the Dry Run must disable the changing migration functions'
+Assert ($ru -match '(?s)function Get-PersonalTorrent\(.*?Get-ImportedPersonalTorrent.*?Resolve-RuTrackerProxy.*?Read-RuTrackerCredential.*?Assert-RuTrackerRoute') 'a verified local file must be used before any network step'
+Assert ($ru -match '(?s)function Save-PersonalTorrentBytes.*?Test-PersonalTorrent \$temp.*?Replace\(\$temp, \$final') 'a personal file must be verified before it replaces the stored one'
+foreach ($file in $production) {
+    if ($file.Name -ne 'RuTracker.ps1') { Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'Set-Acl') "$($file.Name) changes permissions" }
+}
+Assert (([regex]::Matches($ru, 'Set-Acl')).Count -eq 1 -and $ru -match '(?s)function Protect-PersonalTorrentDirectory.*?Set-Acl -LiteralPath \$Folder') 'permissions are changed only for the personal folder'
 
 # Raw exception texts (which could quote a URL with a key) are never written to the console, logs or reports.
 foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {

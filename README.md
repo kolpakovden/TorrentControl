@@ -129,6 +129,63 @@ HTTP-прокси, например порт Hiddify.
    — пустой вывод. Плюс `Test-Path C:\TorrentMonitor\rutracker-*` → `False`. Скрипты входа и проверки не обращаются
    к WebUI и не запускают µTorrent, поэтому в µTorrent новых раздач быть не должно.
 
+**Импорт персонального `.torrent` из Firefox (без сети).** Если TorrentControl сейчас не может обращаться
+к RuTracker сам, а Firefox (вход в RuTracker, официальный плагин) может, файлы скачиваются в Firefox и импортируются.
+TorrentControl при этом не обращается к сети и не читает данные браузера: файл выбирает пользователь.
+- Infohash вычисляется из самого файла; номер темы в имени файла не используется. Hash должен совпасть с записью
+  `auto-state.json`: новый фильм, ждущий персональный файл, или старая раздача TorrentControl в своей папке
+  `D:\Фильмы\rt-<тема>`.
+- Необязательный `-Topic` должен совпасть с темой этой записи. Тема в комментарии файла, если она там есть, не должна
+  ей противоречить.
+- Проверяются bencode и пути (`TorrentMetadata.Verify`) и персональный адрес подтверждённого сервера RuTracker
+  (`Test-PersonalTorrent`). Публичный, посторонний или смешанный список трекеров — отказ. Announce не изменяется
+  и не подставляется.
+- Файл сохраняется байт в байт как `%LOCALAPPDATA%\TorrentControl\personal\<HASH>.torrent`. Папка доступна только
+  текущему пользователю Windows. Повторный импорт того же файла ничего не меняет. Файл, не прошедший проверку,
+  сохранённый не заменяет.
+- `Get-PersonalTorrent` (автозагрузка и перепривязка) сначала берёт такой файл и перед каждым использованием
+  проверяет его заново. Подменённый или повреждённый файл не используется (`PersonalImportInvalid`). Если файла нет,
+  поведение прежнее: «Ожидает авторизацию RuTracker», без публичной версии.
+- Коды отказа: `ImportFileMissing`, `ImportNotInAutoState`, `ImportTopicMismatch`, `ImportStatusNotAllowed`
+  (ручная или чужая запись), `PersonalTorrentInvalid`, `PersonalAnnounceMissing`, `PersonalTrackersUnexpected`,
+  `PersonalTopicMismatch`.
+
+**Подготовка перепривязки старой раздачи (Dry Run, ничего не меняет).** `17-Check-personal-migration.cmd`
+(`Test-PersonalMigration.ps1`):
+- **Список.** `-List` показывает старые раздачи TorrentControl: тему, ссылку на тему, ссылку «скачать .torrent» для
+  Firefox и отметку, импортирован ли файл. Список сохраняется в `personal-migration-list.html`.
+- **Проверка одной раздачи.** `-Topic <номер>` проверяет её целиком:
+  - что раздача принадлежит TorrentControl;
+  - что импортированный файл в порядке;
+  - что в µTorrent есть раздача с тем же hash в своей папке;
+  - что сейчас у неё только публичный трекер.
+
+  Итог — «ГОТОВО К ПЕРЕПРИВЯЗКЕ» или «НЕ ГОТОВО» с причиной.
+- **µTorrent только читается:** `token.html`, `list=1`, `getprops`. Изменяющие функции перепривязки в этом процессе
+  отключены (`ReadOnlyViolation`). Ручные и чужие раздачи из µTorrent даже не читаются.
+- **Рабочая папка** (`-StateDirectory C:\TorrentMonitor`) только читается: `auto-state.json`, `config.json` и
+  `credential.xml` (пароль WebUI расшифровывается в памяти и не копируется). Чтение не мешает работающему монитору,
+  отчёты пишутся в папку тестовой копии. Без WebUI (`-NoWebUI`) проверяются только запись и файл; это не
+  подтверждение готовности.
+
+**Тестовая копия `C:\TorrentControl-p0-net-test`, рабочая установка `C:\TorrentMonitor` не меняется.**
+PowerShell, по одной строке:
+1. `cd C:\TorrentControl-p0-net-test`
+2. Список старых раздач и ссылок:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-PersonalMigration.ps1 -List -StateDirectory C:\TorrentMonitor`
+3. В Firefox открыть `https://rutracker.org/forum/dl.php?t=<тема>` (или ссылку из `personal-migration-list.html`)
+   и сохранить файл.
+4. Импорт:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Import-PersonalTorrent.ps1 "$env:USERPROFILE\Downloads\<файл>.torrent" -Topic <тема> -StateDirectory C:\TorrentMonitor`
+5. Dry Run этой раздачи:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-PersonalMigration.ps1 -Topic <тема> -StateDirectory C:\TorrentMonitor`
+6. Проверка, что рабочая папка не менялась, — как в шагах 1 и 7 «Проверки на реальном ПК» выше.
+
+`16-Import-personal-torrent.cmd` и `17-Check-personal-migration.cmd` принимают те же параметры.
+На `16-…` можно перетащить скачанный файл: папку с `auto-state.json` скрипт спросит сам.
+Перепривязку (замену трекера) этот шаг не выполняет. Её делает `12-Tracker-migration-one.cmd` в рабочей установке
+после обновления и отдельного подтверждения. Начисление статистики подтверждается только после неё (план выше).
+
 **Первоначальная настройка.**
 1. Маршрут к rutracker.org: `15-RuTracker-connection.cmd` должен показать «РАБОТАЕТ» (напрямую или через локальный
    прокси, см. выше).

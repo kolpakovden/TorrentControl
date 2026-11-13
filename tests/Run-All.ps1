@@ -29,6 +29,13 @@ function Get-ProxySettingsSnapshot {
     return ($parts -join "`n")
 }
 $proxyBefore = Get-ProxySettingsSnapshot
+# The working installation (if this is the user's PC) must never be touched by the tests.
+$working = 'C:\TorrentMonitor'
+function Get-WorkingSnapshot {
+    if ([Environment]::OSVersion.Platform -ne [PlatformID]::Win32NT -or !(Test-Path -LiteralPath $working)) { return '' }
+    return (@(Get-ChildItem -LiteralPath $working -File -Force | Where-Object { $_.Name -notin @('monitor.lock') } | ForEach-Object { $_.Name + '|' + $_.Length + '|' + $_.LastWriteTimeUtc.Ticks }) -join "`n")
+}
+$workingBefore = Get-WorkingSnapshot
 $probe = 'D:\Фильмы'
 $probeBefore = @()
 if (Test-Path -LiteralPath $probe) { $probeBefore = @(Get-ChildItem -LiteralPath $probe -Directory -Filter 'rt-9000000*' | ForEach-Object Name) }
@@ -39,6 +46,7 @@ foreach ($test in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'Test-*.ps1
     if ($LASTEXITCODE -ne 0) { $failed += $test.Name; Write-Host "FAIL: $($test.Name) (exit $LASTEXITCODE)" -ForegroundColor Red }
 }
 $after = Get-LocalSnapshot
+if ((Get-WorkingSnapshot) -ne $workingBefore) { $failed += 'working-folder-guard'; Write-Host "FAIL: files in $working changed during the run (if the scheduled monitor ran meanwhile, repeat the tests)." -ForegroundColor Red }
 if ((Get-ProxySettingsSnapshot) -ne $proxyBefore) { $failed += 'proxy-settings-guard'; Write-Host 'FAIL: Windows proxy settings changed during the run.' -ForegroundColor Red }
 if ((Get-ProfileSnapshot) -ne $profileBefore) { $failed += 'profile-guard'; Write-Host 'FAIL: files under %LOCALAPPDATA%\TorrentControl changed during the run.' -ForegroundColor Red }
 $changed = @(@($before.Keys) + @($after.Keys) | Select-Object -Unique | Where-Object { $before[$_] -ne $after[$_] })

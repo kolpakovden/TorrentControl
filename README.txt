@@ -17,6 +17,10 @@ TORRENTCONTROL 1.8
 затем 15-RuTracker-connection.cmd (найдёт и проверит локальный порт, запишет rutracker-proxy.txt).
 Прокси используется только для запросов TorrentControl к RuTracker; настройки Windows не меняются.
 Пароль и cookie зашифрованы DPAPI; на GitHub не передаются.
+Если TorrentControl не достаёт до RuTracker, а Firefox может: скачайте персональный .torrent в Firefox и
+импортируйте 16-Import-personal-torrent.cmd (без сети; файл сверяется с auto-state.json по hash).
+17-Check-personal-migration.cmd -List — старые раздачи и ссылки; -Topic N — Dry Run одной раздачи
+(µTorrent только читается). Команды для тестовой копии — README.md.
 Уже скачанные раздачи, без повторной загрузки, строго по порядку:
 11-Tracker-migration-dry-run.cmd — Dry Run, ничего не меняет (tracker-migration.html);
 12-Tracker-migration-one.cmd — одна раздача с подтверждением;

@@ -118,6 +118,34 @@ public sealed class TorrentMetadata {
         } else { size=(long)info["length"]; if(size<0) throw new FormatException("Negative size"); }
         return size;
     }
+    static Dictionary<string,object> ReadTop(string path, out byte[] raw, out TorrentMetadata parser) {
+        var fi=new FileInfo(path);
+        if (fi.Length>4000000) throw new FormatException("Metadata too large");
+        raw=File.ReadAllBytes(path);
+        parser=new TorrentMetadata(raw);
+        var top=parser.Read(0) as Dictionary<string,object>;
+        if(top==null || parser.pos!=raw.Length || parser.infoStart<0) throw new FormatException("Invalid torrent");
+        return top;
+    }
+    // Infohash (SHA-1 of the bencoded info dictionary) of a local file; the file is only read. Used to find the
+    // TorrentControl record of an imported file - the file name is never trusted.
+    public static string InfoHash(string path) {
+        byte[] raw; TorrentMetadata parser;
+        ReadTop(path, out raw, out parser);
+        using(var sha=System.Security.Cryptography.SHA1.Create())
+            return BitConverter.ToString(sha.ComputeHash(raw,parser.infoStart,parser.infoEnd-parser.infoStart)).Replace("-", "");
+    }
+    // Topic id from a top-level comment such as https://rutracker.org/forum/viewtopic.php?t=123, or "" if there is none.
+    // The comment is outside the infohash: it is only used to refuse a file that names another topic, never as proof.
+    public static string CommentTopic(string path) {
+        byte[] raw; TorrentMetadata parser;
+        var top=ReadTop(path, out raw, out parser);
+        if(!top.ContainsKey("comment")) return "";
+        var bytes=top["comment"] as byte[];
+        if(bytes==null) return "";
+        var match=System.Text.RegularExpressions.Regex.Match(Encoding.UTF8.GetString(bytes), @"viewtopic\.php\?t=(\d{1,12})(?!\d)");
+        return match.Success ? match.Groups[1].Value : "";
+    }
     static string TrackerUrl(object value) {
         var raw=value as byte[];
         if(raw==null) throw new FormatException("Tracker type");
