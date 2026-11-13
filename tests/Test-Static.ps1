@@ -61,6 +61,28 @@ Assert ($ru -match [regex]::Escape("Join-Path `$env:LOCALAPPDATA 'TorrentControl
 # Only confirmed RuTracker tracker domains count as personal; widening the list needs a real file as evidence.
 Assert ($ru -match [regex]::Escape("`$script:RuTrackerTrackerDomains = @('t-ru.org', 'rutracker.cx', 'rutracker.org')")) 'RuTracker tracker domains changed without review'
 Assert ($ru -match [regex]::Escape("`$script:NeutralTrackerHosts = @('retracker.local')")) 'neutral tracker list changed without review'
+# --- Network access to RuTracker: only TorrentControl's own requests, nothing on the computer changes ---------
+foreach ($file in $production) {
+    $text = [regex]::Replace([IO.File]::ReadAllText($file.FullName), '(?m)^\s*#.*$', '')
+    foreach ($pattern in @('(?i)Set-ItemProperty', '(?i)New-ItemProperty', '(?i)\bnetsh\b', '(?i)Set-DnsClient', '(?i)\broute(\.exe)?\s+(add|change|delete)',
+        '(?i)Add-VpnConnection', '(?i)DefaultWebProxy\s*=', '(?i)\breg(\.exe)?\s+(add|delete)', '(?i)ServerCertificateValidationCallback', '(?i)SkipCertificateCheck',
+        '(?i)CheckCertificateRevocationList', '(?i)AllowAutoRedirect\s*=\s*\$true', '(?i)(Start|Stop)-Process[^\r\n]*(hiddify|sing-?box)', 'http://rutracker')) {
+        Assert ($text -notmatch $pattern) "$($file.Name) changes network settings or weakens TLS: '$pattern'"
+    }
+    if ($file.Name -ne 'RuTrackerRoute.cs') {
+        Assert ($text -notmatch 'RemoteCertificateValidationCallback|SslPolicyErrors') "$($file.Name) handles certificate validation"
+    }
+}
+$route = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerRoute.cs'))
+Assert (([regex]::Matches($route, 'new SslStream\(')).Count -eq 1 -and $route -match [regex]::Escape('{ seen = errors; return errors == SslPolicyErrors.None; }')) 'RuTrackerRoute.cs must accept only certificates without errors'
+Assert ($route -match [regex]::Escape('"CONNECT " + host + ":443 HTTP/1.1')) 'route check does not use HTTP CONNECT'
+Assert ($ru -match [regex]::Escape('$request.AllowAutoRedirect = $false') -and $ru -match [regex]::Escape('$request.Proxy = Get-RuTrackerWebProxy') -and $ru -notmatch 'Invoke-WebRequest') 'RuTracker requests must set redirects and the proxy explicitly'
+Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
+$diagnostics = [IO.File]::ReadAllText((Join-Path $repo 'Test-RuTrackerConnection.ps1'))
+foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Import-Clixml', 'Invoke-RuTrackerLogin', 'Get-PersonalTorrent', 'Invoke-RuTrackerHttp', 'Start-Process', 'Stop-Process', 'Set-Content', 'Out-File')) {
+    Assert ($diagnostics -notmatch $pattern) "Test-RuTrackerConnection.ps1 must stay anonymous and read-only: '$pattern'"
+}
+
 # Raw exception texts (which could quote a URL with a key) are never written to the console, logs or reports.
 foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {
     foreach ($line in [IO.File]::ReadAllLines($file.FullName)) {
@@ -79,7 +101,7 @@ foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -File
 }
 
 # --- C# helpers compile with this runtime's compiler (C# 5 under Windows PowerShell 5.1) -----------
-foreach ($type in @('ResumePaths', 'TorrentMetadata')) {
+foreach ($type in @('ResumePaths', 'TorrentMetadata', 'RuTrackerRoute')) {
     if (!($type -as [type])) { Add-Type -Path (Join-Path $repo "$type.cs") }
     Assert ($type -as [type]) "$type did not compile"
 }

@@ -142,7 +142,7 @@ try {
     # --- Whole script in a copy: guard, lock and error logging work outside the test session ------
     $copy = Join-Path $temp 'copy'
     $null = Microsoft.PowerShell.Management\New-Item -Path $copy -ItemType Directory
-    foreach ($name in @('Monitor.ps1','Rules.ps1','LocalPaths.ps1','Feed.ps1','AutoLoad.ps1','RuTracker.ps1','ResumePaths.cs','TorrentMetadata.cs')) {
+    foreach ($name in @('Monitor.ps1','Rules.ps1','LocalPaths.ps1','Feed.ps1','AutoLoad.ps1','RuTracker.ps1','RuTrackerRoute.cs','ResumePaths.cs','TorrentMetadata.cs')) {
         Copy-Item -LiteralPath (Join-Path (Join-Path $PSScriptRoot '..') $name) -Destination $copy
     }
     $exe = (Get-Process -Id $PID).Path

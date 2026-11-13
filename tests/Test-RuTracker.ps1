@@ -173,6 +173,12 @@ try {
     $script:http = New-Object Collections.ArrayList
     $script:allUrls = New-Object Collections.ArrayList
     $script:route = @{}
+    # Route check (RuTrackerRoute.cs, tested live in Test-RuTrackerNet.ps1) and Windows proxy are stubbed here.
+    function New-Route([bool]$Ok, [string]$Code, [string]$Stage) { return [pscustomobject]@{ Ok = $Ok; Code = $Code; Stage = $Stage; ProxyStatus = 0; HttpStatus = 200; TlsErrors = ''; Addresses = 1; ElapsedMs = 1 } }
+    $routeOk = New-Route $true 'Ok' 'Http'
+    $script:routeResult = $routeOk; $script:routeCalls = 0; $script:routeProxy = $null; $script:systemProxy = ''
+    function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) { $script:routeCalls++; $script:routeProxy = $Proxy; return $script:routeResult }
+    function Get-SystemRuTrackerProxy { return $script:systemProxy }
     function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$Form = '') {
         [void]$script:http.Add([pscustomobject]@{ method = $Method; url = $Url; form = $Form })
         [void]$script:allUrls.Add($Url)
@@ -187,6 +193,13 @@ try {
             'loginpage' { return [pscustomobject]@{ status = 200; contentType = 'text/html; charset=windows-1251'; bytes = (Get-RuTrackerEncoding).GetBytes('<html><form action="login.php">Вход</form></html>') } }
             'offline' { return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@() } }
             '404' { return [pscustomobject]@{ status = 404; contentType = 'text/html'; bytes = [byte[]]@() } }
+            'ok-redirect' { $Session.Cookies.Add([Uri]'https://rutracker.org/forum/', (New-Object Net.Cookie('bb_session', '0-FAKE-NEW-SESSION-9'))); return [pscustomobject]@{ status = 302; contentType = 'text/html'; bytes = [byte[]]@(); location = 'https://evil.example/collect' } }
+            'redirect-same' { return [pscustomobject]@{ status = 302; contentType = 'text/html'; bytes = [byte[]]@(); location = '/forum/dl.php?t=6612345&r=1' } }
+            'redirect-loop' { return [pscustomobject]@{ status = 302; contentType = 'text/html'; bytes = [byte[]]@(); location = 'dl.php?t=6612345&r=1' } }
+            'redirect-evil' { return [pscustomobject]@{ status = 302; contentType = 'text/html'; bytes = [byte[]]@(); location = 'https://evil.example/forum/dl.php?t=1' } }
+            'redirect-http' { return [pscustomobject]@{ status = 302; contentType = 'text/html'; bytes = [byte[]]@(); location = 'http://rutracker.org/forum/dl.php?t=1' } }
+            'redirect-port' { return [pscustomobject]@{ status = 307; contentType = 'text/html'; bytes = [byte[]]@(); location = 'https://rutracker.org:8443/forum/dl.php?t=1' } }
+            '429' { return [pscustomobject]@{ status = 429; contentType = 'text/html'; bytes = [byte[]]@() } }
             default { return [pscustomobject]@{ status = 200; contentType = 'application/x-bittorrent'; bytes = (Read-Bytes $answer) } }
         }
     }
@@ -206,6 +219,10 @@ try {
     $script:route.login = 'ok'
     $null = Invoke-RuTrackerLogin $credential $login.captcha 'Ab3d' $login.session
     Assert ($script:http[-1].form -match '&cap_sid=FAKEsid123&cap_code_FAKE0f1e=Ab3d$') 'captcha answer not sent'
+    # The redirect of the login answer is never followed (the session cookie comes with the 302 itself).
+    $script:http.Clear(); $script:route.login = 'ok-redirect'
+    $login = Invoke-RuTrackerLogin $credential
+    Assert ($login.ok -and $script:http.Count -eq 1 -and @($script:allUrls | Where-Object { $_ -match 'evil' }).Count -eq 0) 'login redirect followed'
     $script:route.login = 'wrong'
     $login = Invoke-RuTrackerLogin $credential
     Assert (!$login.ok -and $null -eq $login.captcha) 'wrong password not reported'
@@ -294,11 +311,74 @@ try {
     Reset-Login
     Assert-Throws { Get-PersonalTorrent $dir 'abc' $siteHash } 'RuTrackerTopicUnavailable' 'bad topic id requested'
     Assert ($script:http.Count -eq 0) 'request for a bad topic id'
+    # --- The route is checked anonymously before any password or cookie leaves the computer ----------------
+    $script:storedSession = 'bb_session=0-FAKE-STORED-1'; $script:route.dl = $site; $script:route.login = 'ok'
+    $routeCases = @(
+        @('ProxyUnreachable', 'ProxyConnect', 'RuTrackerProxyUnavailable'), @('ProxyAuthRequired', 'ProxyTunnel', 'RuTrackerProxyUnavailable'),
+        @('ProxyRefused', 'ProxyTunnel', 'RuTrackerProxyUnavailable'), @('TlsCertificateInvalid', 'Tls', 'RuTrackerTlsFailed'),
+        @('TlsFailed', 'Tls', 'RuTrackerTlsFailed'), @('HttpRateLimited', 'Http', 'RuTrackerBlocked'), @('HttpForbidden', 'Http', 'RuTrackerBlocked'),
+        @('DnsFailed', 'Dns', 'RuTrackerUnavailable'), @('ConnectFailed', 'Connect', 'RuTrackerUnavailable'), @('Timeout', 'Connect', 'RuTrackerUnavailable'))
+    foreach ($case in $routeCases) {
+        Reset-Login; Reset-RuTrackerRoute
+        $script:routeResult = New-Route $false $case[0] $case[1]
+        Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } $case[2] "route $($case[0]) not reported"
+        Assert ($script:http.Count -eq 0) "cookie sent although the route failed ($($case[0]))"
+        Assert-Throws { Invoke-RuTrackerLogin $credential } $case[2] "login despite route $($case[0])"
+        Assert ($script:http.Count -eq 0) "password sent although the route failed ($($case[0]))"
+        Assert (!(Read-RuTrackerState $dir).blocked) "network problem $($case[0]) blocked automatic logins"
+    }
+    # Through the configured proxy, network failures are reported as a proxy problem.
+    $proxyFile = Join-Path $dir 'rutracker-proxy.txt'
+    [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($proxyFile), 'http://127.0.0.1:12334')
+    foreach ($code in @('Timeout', 'DnsFailed', 'ConnectFailed')) {
+        Reset-Login; Reset-RuTrackerRoute
+        $script:routeResult = New-Route $false $code 'ProxyConnect'
+        Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerProxyUnavailable' "proxy $code not reported as a proxy problem"
+        Assert ($script:routeProxy -eq 'http://127.0.0.1:12334' -and $script:http.Count -eq 0) "route not checked through the proxy ($code)"
+    }
+    # A working route is checked once and reused for 10 minutes; a different proxy is checked again.
+    $script:routeResult = $routeOk; Reset-RuTrackerRoute; $script:routeCalls = 0
+    Reset-Login; $null = Get-PersonalTorrent $dir $topic $siteHash
+    Reset-Login; $null = Get-PersonalTorrent $dir $topic $siteHash
+    Assert ($script:routeCalls -eq 1 -and $script:proxySeen -eq 'http://127.0.0.1:12334') 'working route not reused or proxy not used'
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $proxyFile
+    Reset-Login; $null = Get-PersonalTorrent $dir $topic $siteHash
+    Assert ($script:routeCalls -eq 2 -and $script:routeProxy -eq '' -and $script:proxySeen -eq '') 'route not re-checked after the proxy changed'
+    # Windows proxy setting is used only without rutracker-proxy.txt (read, never changed).
+    $script:systemProxy = 'http://10.0.0.5:3128'
+    Reset-Login; Reset-RuTrackerRoute; $null = Get-PersonalTorrent $dir $topic $siteHash
+    Assert ($script:routeProxy -eq 'http://10.0.0.5:3128' -and $script:proxySeen -eq 'http://10.0.0.5:3128') 'Windows proxy not used'
+    [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($proxyFile), 'http://127.0.0.1:12334')
+    Reset-Login; Reset-RuTrackerRoute; $null = Get-PersonalTorrent $dir $topic $siteHash
+    Assert ($script:routeProxy -eq 'http://127.0.0.1:12334') 'rutracker-proxy.txt does not take precedence'
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $proxyFile
+    $script:systemProxy = ''; Reset-RuTrackerRoute
+
+    # --- Redirects are followed only inside https://rutracker.org/forum/ ------------------------------------
+    Reset-Login; $script:route.dl = @('redirect-same', $site)
+    $result = Get-PersonalTorrent $dir $topic $siteHash
+    Assert (@(Get-Calls 'dl').Count -eq 2 -and $script:http[1].url -eq 'https://rutracker.org/forum/dl.php?t=6612345&r=1' -and $result.host -eq 'bt2.rutracker.cx') 'same-site redirect not followed'
+    foreach ($case in @('redirect-evil', 'redirect-http', 'redirect-port')) {
+        Reset-Login; $script:route.dl = $case
+        Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerRedirectRefused' "$case followed"
+        Assert ($script:http.Count -eq 1) "$($case): a second request was made"
+    }
+    Reset-Login; $script:route.dl = 'redirect-loop'
+    Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerRedirectRefused' 'redirect loop accepted'
+    Assert ($script:http.Count -eq 4) 'redirect loop not bounded'
+    Reset-Login; $script:route.dl = '429'
+    Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'RuTrackerBlocked' 'HTTP 429 not reported'
+    Assert (@(Get-Calls 'login').Count -eq 0) 'HTTP 429 caused a login'
+    Assert ((Resolve-RuTrackerRedirect 'https://rutracker.org/forum/dl.php?t=1' 'dl.php?t=2') -eq 'https://rutracker.org/forum/dl.php?t=2') 'relative redirect'
+    foreach ($bad in @('https://rutracker.org.evil.example/forum/x', 'https://evil.example/forum/', 'http://rutracker.org/forum/x', 'https://rutracker.org:8443/forum/x',
+        'https://user:pw@rutracker.org/forum/x', 'https://rutracker.org/other/x', '', '//evil.example/forum/x', 'https://RUTRACKER.org.evil.example/forum/')) {
+        Assert-Throws { Resolve-RuTrackerRedirect 'https://rutracker.org/forum/dl.php?t=1' $bad } 'RuTrackerRedirectRefused' "redirect accepted: $bad"
+    }
     $script:route.dl = $site
     $env:LOCALAPPDATA = ''
     Assert-Throws { Get-PersonalTorrent $dir $topic $siteHash } 'LocalAppDataMissing' 'missing profile folder'
     $env:LOCALAPPDATA = Join-Path $temp 'LocalAppData'
     # Only rutracker.org/forum login.php and dl.php are ever requested.
-    Assert ($script:allUrls.Count -gt 20 -and @($script:allUrls | Where-Object { $_ -notmatch '^https://rutracker\.org/forum/(login\.php|dl\.php\?t=\d+)$' }).Count -eq 0) 'unexpected address requested'
+    Assert ($script:allUrls.Count -gt 20 -and @($script:allUrls | Where-Object { $_ -notmatch '^https://rutracker\.org/forum/(login\.php|dl\.php\?t=\d+(&r=1)?)$' }).Count -eq 0) 'unexpected address requested'
 } finally { $env:LOCALAPPDATA = $savedLocal; Remove-TestDirectory $temp }
 "PASS Test-RuTracker: $script:AssertCount assertions"

@@ -9,7 +9,7 @@
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
-    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing|TrackersUnexpected)|LocalAppDataMissing)$') {return $Exception.Message}
+    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|ProxyUnavailable|TlsFailed|Blocked|RedirectRefused|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing|TrackersUnexpected)|LocalAppDataMissing)$') {return $Exception.Message}
     if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
 }
@@ -156,7 +156,11 @@ function Write-AutoReport($State,[string]$Directory) {
         RuTrackerCaptchaRequired='RuTracker просит CAPTCHA: запустите 9-RuTracker-login.cmd и введите код. Публичная версия не добавляется.'
         RuTrackerLoginFailed='RuTracker не принял логин или пароль: запустите 9-RuTracker-login.cmd. Публичная версия не добавляется.'
         RuTrackerAuthExpired='Сессия RuTracker не действует; повтор при следующем опросе. Публичная версия не добавляется.'
-        RuTrackerUnavailable='RuTracker недоступен; повтор при следующем опросе. Публичная версия не добавляется.'
+        RuTrackerUnavailable='rutracker.org недоступен с этого компьютера напрямую: нужен локальный прокси (15-RuTracker-connection.cmd, README). Публичная версия не добавляется.'
+        RuTrackerProxyUnavailable='Прокси для RuTracker не отвечает или отказал (Hiddify выключен, другой порт или режим VPN): 15-RuTracker-connection.cmd. Публичная версия не добавляется.'
+        RuTrackerTlsFailed='Защищённое соединение с rutracker.org не установлено (сертификат или TLS); пароль и cookie не отправлялись. Публичная версия не добавляется.'
+        RuTrackerBlocked='rutracker.org отказал в доступе (HTTP 403/429); повтор при следующем опросе. Публичная версия не добавляется.'
+        RuTrackerRedirectRefused='RuTracker перенаправил запрос за пределы rutracker.org/forum; запрос не выполнен. Публичная версия не добавляется.'
         RuTrackerTopicUnavailable='Тема недоступна на RuTracker; повтор при следующем опросе.'
         PersonalAnnounceMissing='В полученном .torrent нет персонального адреса подтверждённого сервера RuTracker (bt*.t-ru.org, bt*.rutracker.cx, bt*.rutracker.org); публичная версия не добавляется.'
         PersonalTrackersUnexpected='В полученном .torrent кроме персонального адреса есть публичный или посторонний трекер; файл не добавляется, нужна проверка.'

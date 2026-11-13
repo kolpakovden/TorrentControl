@@ -12,7 +12,11 @@ $explain = @{
     RuTrackerNotConfigured = 'Вход не настроен: запустите 9-RuTracker-login.cmd.'
     RuTrackerCredentialUnreadable = 'rutracker-credential.xml не читается этой учётной записью Windows. Повторите 9-RuTracker-login.cmd под тем пользователем, от имени которого работает монитор.'
     RuTrackerAuthExpired = 'Сессия не действует, а повторный вход не дал файл. Повторите 9-RuTracker-login.cmd.'
-    RuTrackerUnavailable = 'rutracker.org недоступен с этого компьютера. Если сайт открывается только через прокси, укажите HTTP-прокси в rutracker-proxy.txt (README).'
+    RuTrackerUnavailable = 'rutracker.org недоступен с этого компьютера напрямую. Запустите 15-RuTracker-connection.cmd: он найдёт и проверит локальный прокси (Hiddify) и запишет rutracker-proxy.txt.'
+    RuTrackerProxyUnavailable = 'Прокси из rutracker-proxy.txt не отвечает или отказал. Проверьте, что Hiddify подключён в режиме «Только прокси», и запустите 15-RuTracker-connection.cmd.'
+    RuTrackerTlsFailed = 'Защищённое соединение с rutracker.org не установлено (сертификат или TLS). Пароль не отправлялся. Проверка сертификатов не отключается.'
+    RuTrackerBlocked = 'rutracker.org ответил 403/429 (доступ запрещён или слишком много запросов). Повторите позже.'
+    RuTrackerRedirectRefused = 'RuTracker перенаправил запрос на другой адрес; запрос не выполнен.'
     RuTrackerProxyInvalid = 'rutracker-proxy.txt должен содержать одну строку вида http://адрес:порт (без логина и пароля).'
     RuTrackerTopicUnavailable = 'Проверочная тема недоступна; повторите позже.'
     PersonalAnnounceMissing = 'Файл получен, но в нём нет персонального адреса подтверждённого сервера RuTracker (bt*.t-ru.org, bt*.rutracker.cx, bt*.rutracker.org).'
@@ -25,8 +29,12 @@ $lock = $null
 try {
     $lock = [IO.File]::Open("$PSScriptRoot\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None')
     $files = Get-RuTrackerFiles $PSScriptRoot
-    $script:RuTrackerProxy = Read-RuTrackerProxy $PSScriptRoot
-    if ($script:RuTrackerProxy) { Write-Host ('Запросы к RuTracker идут через прокси ' + $script:RuTrackerProxy) }
+    $script:RuTrackerProxy = Resolve-RuTrackerProxy $PSScriptRoot
+    if ($script:RuTrackerProxy) { Write-Host ('Запросы к RuTracker идут через прокси ' + $script:RuTrackerProxy + ' (только для TorrentControl).') }
+    else { Write-Host 'Запросы к RuTracker идут напрямую (rutracker-proxy.txt нет, прокси Windows не задан).' }
+    # The route is checked anonymously before the password is asked for and sent.
+    Assert-RuTrackerRoute
+    Write-Host 'Соединение с rutracker.org проверено (TLS, сертификат действителен).'
     if (!$Check) {
         Write-Host 'Вход в RuTracker для персональных .torrent. Пароль хранится зашифрованным для этой учётной записи Windows (DPAPI)'
         Write-Host 'и отправляется только на rutracker.org. На GitHub не передаётся ничего из этих данных.'

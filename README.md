@@ -62,11 +62,76 @@
   и имя сервера; ключи, cookie и пароли дополнительно маскируются.
 - Cookie браузера не читаются: используется только вход, выполненный в `9-RuTracker-login.cmd`.
 
+**Доступ к rutracker.org с этого компьютера.** Часто rutracker.org напрямую не открывается: DNS не разрешает имя,
+а `Invoke-WebRequest` возвращает статус 0. Плагин RuTracker в Firefox работает только внутри Firefox,
+и TorrentControl его не использует и не читает. Для TorrentControl нужен свой разрешённый маршрут — локальный
+HTTP-прокси, например порт Hiddify.
+- Маршрут выбирается так: `rutracker-proxy.txt` (одна строка `http://127.0.0.1:<порт>`), иначе прокси Windows,
+  если он задан, иначе прямое соединение. Через прокси идут только вход на rutracker.org и скачивание `.torrent`.
+  µTorrent, WebTLO, Firefox, остальные программы, DNS, маршруты, VPN, реестр и прокси Windows не меняются.
+  Hiddify не запускается и не перенастраивается.
+- HTTPS идёт через HTTP CONNECT. Прокси видит только `rutracker.org:443`; адрес страницы, пароль и cookie передаются
+  внутри TLS. Сертификат rutracker.org проверяется обычным образом, и проверка не отключается.
+  Прокси с паролем и SOCKS не поддерживаются.
+- Перед первым запросом с паролем или cookie маршрут проверяется анонимно: соединение, CONNECT, TLS с проверкой
+  сертификата и ответ `https://rutracker.org/forum/index.php`. Если проверка не прошла, пароль и cookie не
+  отправляются, запись ждёт с кодом, и **публичная версия не добавляется**. Коды:
+  - `RuTrackerUnavailable` — сайт недоступен напрямую, нужен прокси;
+  - `RuTrackerProxyUnavailable` — прокси не отвечает, требует пароль или не открыл туннель;
+  - `RuTrackerTlsFailed` — ошибка TLS или сертификата;
+  - `RuTrackerBlocked` — сайт ответил 403 или 429;
+  - `RuTrackerRedirectRefused` — перенаправление за пределы `https://rutracker.org/forum/`.
+- Перенаправления не выполняются автоматически. Ответ на вход не открывается вообще: cookie сессии приходит вместе
+  с ним. При скачивании допускаются не больше 3 переходов и только внутри `https://rutracker.org/forum/`.
+
+**Hiddify** (по исходному коду клиента `hiddify-app` / `hiddify-core`). Локальный порт — это sing-box `mixed`
+(HTTP и SOCKS на одном порту) на `127.0.0.1`. Он открыт в режимах «Только прокси» и «Установить системный прокси».
+В режиме «VPN», который стоит по умолчанию, локальный порт не открывается.
+1. Подключитесь в Hiddify к своему профилю.
+2. В настройках выберите «Режим службы» → «Только прокси». Этот режим не меняет прокси Windows и не направляет
+   остальной трафик через Hiddify. «Установить системный прокси» тоже подойдёт, но переключит на прокси всю Windows.
+3. Там же посмотрите «Порт прокси (SOCKS5/4, HTTP)». По умолчанию это 12334, но используйте значение из настройки.
+4. Запустите `15-RuTracker-connection.cmd`. Он найдёт порты Hiddify / sing-box на этом компьютере, проверит каждый
+   настоящим запросом через HTTP CONNECT и предложит записать рабочий в `rutracker-proxy.txt` (нужно ввести `YES`).
+   Порты других программ (WebUI µTorrent и т. п.) не проверяются.
+
+Если локального прокси нет (Hiddify не установлен, не подключён или работает только как VPN), TorrentControl не
+сможет получать персональные `.torrent`, и автозагрузка будет ждать. Внешние прокси из интернета автоматически
+не предлагаются и не используются.
+
+`Test-RuTrackerConnection.ps1` (запускается из `15-RuTracker-connection.cmd`) проверяет:
+- DNS и прямое HTTPS;
+- прокси из `rutracker-proxy.txt`, прокси Windows и найденные порты Hiddify;
+- для каждого прокси: соединение, CONNECT, TLS и ответ сайта.
+
+Причину отказа он объясняет понятным текстом и сохраняет отчёт в `rutracker-connection.txt`. Логин, пароль, cookie
+и адреса трекеров он не читает и не использует. Параметры: `-Proxy http://127.0.0.1:<порт>`, `-FindLocalProxy`,
+`-Save` (записать рабочий прокси без вопроса), `-TimeoutSec`.
+
+**Проверка на реальном ПК (тестовая копия, отдельно от `C:\TorrentMonitor`).** Команды выполняются в PowerShell
+в папке тестовой копии; вместо `12334` подставьте свой порт.
+1. Снимок рабочей установки до проверки:
+   `Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.xml,config.json | Get-FileHash | Select-Object Path,Hash | Export-Csv $env:TEMP\tm-before.csv -NoTypeInformation`
+2. Локальный HTTP-прокси Hiddify:
+   `Get-NetTCPConnection -State Listen | Where-Object { $_.LocalAddress -in '127.0.0.1','0.0.0.0' } | ForEach-Object { '{0}:{1} {2}' -f $_.LocalAddress, $_.LocalPort, (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } | Select-String 'hiddify|sing-box'`
+3. RuTracker через него, без входа:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy http://127.0.0.1:12334`
+   Нужна строка `РАБОТАЕТ (HTTP 200, TLS и сертификат в порядке)`.
+4. Записать прокси в тестовую копию:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy http://127.0.0.1:12334 -Save`
+5. Вход: `.\9-RuTracker-login.cmd`. Он проверит маршрут ещё до запроса пароля, затем скачает персональный `.torrent`
+   текущей темы ленты и сверит infohash.
+6. Персональный `.torrent` и его announce, без вывода ключа:
+   `powershell -NoProfile -ExecutionPolicy Bypass -Command '. .\AutoLoad.ps1; . .\RuTracker.ps1; $f = Get-ChildItem "$env:LOCALAPPDATA\TorrentControl\personal\*.torrent" | Sort-Object LastWriteTime | Select-Object -Last 1; $i = Get-TorrentTrackerInfo $f.FullName; [pscustomobject]@{ File = $f.Name; Host = $i.host; Personal = $i.personal; Public = $i.public; Other = $i.other } | Format-List'`
+   Ожидается сервер `bt2.rutracker.cx` (или другой `bt*`), `Personal` ≥ 1, `Public` = 0, `Other` = 0. Имя файла — это infohash темы.
+7. Рабочая установка не изменилась:
+   `Compare-Object (Import-Csv $env:TEMP\tm-before.csv) (Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.xml,config.json | Get-FileHash | Select-Object Path,Hash) -Property Path,Hash`
+   — пустой вывод. Плюс `Test-Path C:\TorrentMonitor\rutracker-*` → `False`. Скрипты входа и проверки не обращаются
+   к WebUI и не запускают µTorrent, поэтому в µTorrent новых раздач быть не должно.
+
 **Первоначальная настройка.**
-1. rutracker.org должен открываться с этого компьютера. Если сайт доступен только через HTTP-прокси, создайте рядом
-   со скриптами `rutracker-proxy.txt` с одной строкой `http://адрес:порт`: прокси используется только для запросов
-   к RuTracker, системные настройки не меняются. Без файла действуют настройки прокси Windows.
-   Прокси с паролем и SOCKS не поддерживаются.
+1. Маршрут к rutracker.org: `15-RuTracker-connection.cmd` должен показать «РАБОТАЕТ» (напрямую или через локальный
+   прокси, см. выше).
 2. Запустите `9-RuTracker-login.cmd` **под тем пользователем Windows, под которым работает монитор**, и введите
    логин и пароль RuTracker. Если сайт попросит CAPTCHA, картинка откроется, код вводится вручную (до 3 попыток).
 3. Скрипт сразу проверяет результат: скачивает персональный `.torrent` одной из текущих тем ленты, сверяет infohash
@@ -258,7 +323,9 @@ Atom содержит `updated`, а не `published`: впервые замеч�
 - «Ожидает метаданные» — GitHub ещё не получил `.torrent`, проверка повторится.
 - «Ожидает место» — не хватает места с учётом запаса и незавершённых заданий.
 - «Ожидает авторизацию RuTracker» — персональный `.torrent` не получен (причина в журнале); публичная версия не
-  добавляется. Обычно помогает `9-RuTracker-login.cmd`; проверка — `10-RuTracker-check.cmd`.
+  добавляется. При сетевых кодах (`RuTrackerUnavailable`, `RuTrackerProxyUnavailable`, `RuTrackerTlsFailed`)
+  запустите `15-RuTracker-connection.cmd`, иначе обычно помогает `9-RuTracker-login.cmd`;
+  проверка — `10-RuTracker-check.cmd`.
 - «Передано клиенту» — ждём появления хеша и пути в WebUI/resume.dat. Повторной передачи не будет.
 - «Нужна проверка» — проверьте задание и путь в µTorrent; следующие добавления блокируются.
   Затем запустите `8-Review-autoload.cmd`. Не удаляйте `auto-state.json` для обхода блокировки:

@@ -26,6 +26,7 @@ __pycache__/
 *.bak
 rutracker-credential.xml
 rutracker-proxy.txt
+rutracker-connection.txt
 rutracker-session.xml
 rutracker-state.json
 tracker-migration.json

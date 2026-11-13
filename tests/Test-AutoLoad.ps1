@@ -405,7 +405,7 @@ try {
     Assert ((Get-FileText (Join-Path $temp 'auto-downloads.html')) -match 'bt2\.rutracker\.cx') 'tracker server not shown in the journal'
     # Without a working personal .torrent nothing is added: the public version is never used instead.
     $before = $script:launches.Count
-    foreach ($code in @('RuTrackerNotConfigured', 'RuTrackerCredentialUnreadable', 'RuTrackerProxyInvalid', 'RuTrackerCaptchaRequired', 'RuTrackerLoginFailed', 'RuTrackerAuthExpired', 'RuTrackerUnavailable', 'PersonalAnnounceMissing', 'PersonalTrackersUnexpected', 'PersonalTorrentInvalid', 'LocalAppDataMissing')) {
+    foreach ($code in @('RuTrackerNotConfigured', 'RuTrackerCredentialUnreadable', 'RuTrackerProxyInvalid', 'RuTrackerProxyUnavailable', 'RuTrackerTlsFailed', 'RuTrackerBlocked', 'RuTrackerRedirectRefused', 'RuTrackerCaptchaRequired', 'RuTrackerLoginFailed', 'RuTrackerAuthExpired', 'RuTrackerUnavailable', 'PersonalAnnounceMissing', 'PersonalTrackersUnexpected', 'PersonalTorrentInvalid', 'LocalAppDataMissing')) {
         Reset-AutoState
         $script:personalMode = $code
         $message = Run-Auto $new
