@@ -52,12 +52,23 @@ foreach ($file in $production) {
 foreach ($name in @('AutoLoad.ps1', 'TorrentMetadata.cs', 'TrackerMigration.ps1', 'Setup-RuTracker.ps1')) {
     # The public magnet announce is only recognised (RuTracker.ps1), never written into a torrent.
     $path = Join-Path $repo $name
-    if (Test-Path -LiteralPath $path) { Assert ([IO.File]::ReadAllText($path) -notmatch 'ann\?magnet|t-ru\.org') "$name contains the public announce" }
+    if (Test-Path -LiteralPath $path) { Assert ([IO.File]::ReadAllText($path) -notmatch 'ann\?magnet|https?://[^\s''"]*t-ru\.org') "$name contains the public announce" }
 }
 $ru = [IO.File]::ReadAllText((Join-Path $repo 'RuTracker.ps1'))
 $hosts = @([regex]::Matches([regex]::Replace($ru, '(?m)^\s*#.*$', '').Replace('\.', '.'), 'https?://[A-Za-z0-9.-]+') | ForEach-Object { $_.Value } | Select-Object -Unique)
 Assert (@($hosts | Where-Object { $_ -notin @('https://rutracker.org', 'http://bt.t-ru.org', 'https://static.rutracker.cc') }).Count -eq 0) "RuTracker.ps1 addresses: $($hosts -join ', ')"
 Assert ($ru -match [regex]::Escape("Join-Path `$env:LOCALAPPDATA 'TorrentControl\personal'")) 'personal torrents must live in the Windows profile'
+# Only confirmed RuTracker tracker domains count as personal; widening the list needs a real file as evidence.
+Assert ($ru -match [regex]::Escape("`$script:RuTrackerTrackerDomains = @('t-ru.org', 'rutracker.cx', 'rutracker.org')")) 'RuTracker tracker domains changed without review'
+Assert ($ru -match [regex]::Escape("`$script:NeutralTrackerHosts = @('retracker.local')")) 'neutral tracker list changed without review'
+# Raw exception texts (which could quote a URL with a key) are never written to the console, logs or reports.
+foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {
+    foreach ($line in [IO.File]::ReadAllLines($file.FullName)) {
+        if ($line -match 'Exception\.Message' -and $line -match 'Write-Host|Write-Output|Add-Content|Set-Content|Out-File|ConvertTo-Html') {
+            Assert $false "$($file.Name) writes a raw exception message: $($line.Trim())"
+        }
+    }
+}
 $ignored = [IO.File]::ReadAllText((Join-Path $repo '.gitignore'))
 foreach ($name in @('rutracker-credential.xml', 'rutracker-session.xml', 'rutracker-state.json', 'tracker-migration.json', 'tracker-migration.html', 'tracker-migration.csv', 'credential.xml')) {
     Assert ($ignored -match ('(?m)^' + [regex]::Escape($name) + '\s*$')) "$name is not in .gitignore"

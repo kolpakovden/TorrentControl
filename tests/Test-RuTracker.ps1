@@ -12,8 +12,8 @@ try {
     function Read-Bytes([string]$Path) { return ,[IO.File]::ReadAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)) }
     function Test-Path2([string]$Path) { return [IO.File]::Exists($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)) }
 
-    # --- Announce analysis: any server, any key parameter name, any key length ------------------------------
-    $servers = @('bt.t-ru.org', 'bt2.rutracker.cx', 'bt3.t-ru.org', 'bt4.rutracker.cc')
+    # --- Announce analysis: confirmed RuTracker servers, any key parameter name, any key length --------------
+    $servers = @('bt.t-ru.org', 'bt2.rutracker.cx', 'bt3.t-ru.org', 'bt4.rutracker.org')
     $keys = @(@('kk', 'FAKEkk01'), @('pk', ('0123456789abcdef' * 2)), @('uk', 'FAKE-uk-key-of-another-length-123456'), @('kk', 'x1y2'))
     foreach ($server in $servers) {
         foreach ($key in $keys) {
@@ -23,6 +23,33 @@ try {
         }
     }
     Assert ((Get-AnnounceInfo 'https://bt2.rutracker.cx/ann?pk=abc&uk=def').personal) 'two key parameters'
+    Assert ((Get-AnnounceInfo 'http://BT2.RuTracker.CX/ann?kk=FAKEcase').host -eq 'bt2.rutracker.cx') 'host case matters'
+    Assert ((Get-AnnounceInfo 'http://bt12.t-ru.org/ann?somekey=FAKE-0123456789-abcdefghijklmnopqrstuvwxyz-0123456789').personal) 'server number or key name/length fixed'
+    # Not RuTracker: a query parameter on any other host never makes a tracker personal (and never public).
+    $foreign = @(
+        'https://example.com/announce?id=123', 'http://example.com/ann?kk=FAKEforeign', 'http://tracker.example.org/ann?pk=FAKEforeign',
+        'http://bt2.rutracker.cx.example.com/ann?kk=FAKEforeign', 'http://evil-rutracker.cx/ann?kk=FAKEforeign', 'http://bt2.evilrutracker.cx/ann?kk=FAKEforeign',
+        'http://rutracker.cx/ann?kk=FAKEforeign', 'http://www.rutracker.org/ann?kk=FAKEforeign', 'http://bt2.forum.rutracker.org/ann?kk=FAKEforeign',
+        'http://bt2.rutracker.cc/ann?kk=FAKEforeign', 'http://bt2.rutracker.net/ann?kk=FAKEforeign', 'http://bt2.t-ru.org.example/ann?kk=FAKEforeign',
+        'http://tracker2.t-ru.org/ann?kk=FAKEforeign', 'http://btx.t-ru.org/ann?kk=FAKEforeign', 'http://bt123.t-ru.org/ann?kk=FAKEforeign',
+        'http://bt2.rutracker.cx/announce?kk=FAKEforeign', 'http://bt2.rutracker.cx/ann/?kk=FAKEforeign', 'http://bt2.rutracker.cx/x/ann?kk=FAKEforeign',
+        'http://bt2.rutracker.cx/./ann?kk=FAKEforeign', 'http://bt2.rutracker.cx:8080/ann?kk=FAKEforeign', 'http://bt2.rutracker.cx:80/ann?kk=FAKEforeign',
+        'http://bt2.rutracker.cx/ann?kk=FAKEforeign&magnet', 'http://bt2.rutracker.cx/ann?magnet&kk=FAKEforeign', 'http://bt2.rutracker.cx/ann?kk==x',
+        'http://bt2.rutracker.cx/ann?=FAKEforeign', 'http://bt2.rutracker.cx/ann?1k=FAKEforeign', 'http://bt2.rutracker.cx/ann?kk=FAKE"x',
+        'http://bt2.rutracker.cx\ann?kk=FAKEforeign', 'http://example.com/ann?magnet', 'http://retracker.local/announce?kk=FAKEforeign')
+    foreach ($url in $foreign) {
+        $a = Get-AnnounceInfo $url
+        Assert (!$a.personal -and !$a.public -and !$a.neutral) "foreign or malformed tracker classified as RuTracker/neutral: $url"
+    }
+    Assert ((Get-AnnounceInfo 'http://retracker.local/announce').neutral -and !(Get-AnnounceInfo 'http://retracker.local/announce').personal) 'retracker not neutral'
+    Assert (!(Get-AnnounceInfo 'http://tracker.example/announce').neutral) 'any keyless tracker treated as neutral'
+    # Tracker sets: one foreign or public entry makes a list unexpected.
+    function Set-Kind($Urls) { $s = Get-TrackerSetInfo $Urls; return ('{0}/{1}/{2}/{3}' -f $s.personal, $s.public, $s.neutral, $s.other) }
+    Assert ((Set-Kind @('http://bt2.rutracker.cx/ann?kk=FAKEset1', 'http://retracker.local/announce')) -eq '1/0/1/0') 'personal + retracker'
+    Assert ((Set-Kind @('http://bt2.rutracker.cx/ann?kk=FAKEset1', 'https://example.com/announce?id=123')) -eq '1/0/0/1') 'personal + foreign'
+    Assert ((Set-Kind @('http://bt2.rutracker.cx/ann?kk=FAKEset1', 'http://bt.t-ru.org/ann?magnet')) -eq '1/1/0/0') 'personal + public'
+    Assert ((Set-Kind @('https://example.com/announce?id=FAKEforeignkey')) -eq '0/0/0/1') 'foreign only'
+    Assert ((Protect-SecretText 'x FAKEforeignkey y') -eq 'x *** y') 'key of a foreign tracker not registered as secret'
     $public = Get-AnnounceInfo 'http://bt.t-ru.org/ann?magnet'
     Assert ($public.valid -and $public.public -and !$public.personal) 'public magnet announce not recognised'
     Assert ((Get-AnnounceInfo 'http://bt4.t-ru.org/ann?magnet').public) 'public announce on another server'
@@ -58,9 +85,22 @@ try {
     Assert-Throws { Test-PersonalTorrent (Join-Path $src 'noannounce.torrent') $hash } 'PersonalAnnounceMissing' 'torrent without announce accepted'
     $null = New-TestTorrentFile (Join-Path $src 'retracker.torrent') $info 'http://retracker.local/announce'
     Assert-Throws { Test-PersonalTorrent (Join-Path $src 'retracker.torrent') $hash } 'PersonalAnnounceMissing' 'retracker-only torrent accepted'
-    $mixed = Join-Path $src 'mixed.torrent'
-    $null = New-TestTorrentFile $mixed $info 'http://bt3.t-ru.org/ann?pk=FAKEmixed' @(@('http://bt3.t-ru.org/ann?pk=FAKEmixed'), @('http://bt.t-ru.org/ann?magnet'))
-    Assert ((Test-PersonalTorrent $mixed $hash).host -eq 'bt3.t-ru.org') 'site file with an extra public tier rejected'
+    # Mixed lists: the personal announce plus a public RuTracker or any foreign tracker is not used (fail-closed).
+    $mixedCases = @(
+        @('public', @(@('http://bt3.t-ru.org/ann?pk=FAKEmixed'), @('http://bt.t-ru.org/ann?magnet')), 'PersonalTrackersUnexpected'),
+        @('foreign-keyed', @(@('http://bt3.t-ru.org/ann?pk=FAKEmixed'), @('https://example.com/announce?id=123')), 'PersonalTrackersUnexpected'),
+        @('foreign-same-tier', @(,@('http://bt3.t-ru.org/ann?pk=FAKEmixed', 'http://tracker.example/announce')), 'PersonalTrackersUnexpected'),
+        @('unknown-domain', @(@('http://bt3.t-ru.org/ann?pk=FAKEmixed'), @('http://bt2.rutracker.cc/ann?kk=FAKEmixed')), 'PersonalTrackersUnexpected'),
+        @('foreign-only', @(,@('https://example.com/announce?id=FAKEforeign123')), 'PersonalAnnounceMissing'),
+        @('lookalike-only', @(,@('http://bt2.rutracker.cx.example.com/ann?kk=FAKElookalike')), 'PersonalAnnounceMissing'),
+        @('unconfirmed-domain-only', @(,@('http://bt2.rutracker.cc/ann?kk=FAKEunconfirmed')), 'PersonalAnnounceMissing'))
+    foreach ($case in $mixedCases) {
+        $path = Join-Path $src ('mixed-' + $case[0] + '.torrent')
+        $null = New-TestTorrentFile $path $info ([string]@($case[1])[0][0]) $case[1]
+        Assert-Throws { Test-PersonalTorrent $path $hash } $case[2] "mixed tracker list accepted: $($case[0])"
+    }
+    $null = New-TestTorrentFile (Join-Path $src 'foreign-announce.torrent') $info 'https://example.com/announce?id=123'
+    Assert-Throws { Test-PersonalTorrent (Join-Path $src 'foreign-announce.torrent') $hash } 'PersonalAnnounceMissing' 'foreign announce with a query accepted as personal'
     $other = New-TestTorrentFile (Join-Path $src 'other.torrent') (New-TestInfo 'Film.mkv' 58 'other') 'http://bt2.rutracker.cx/ann?kk=FAKEother'
     Assert-Throws { Test-PersonalTorrent (Join-Path $src 'other.torrent') $hash } 'PersonalHashMismatch' 'infohash mismatch accepted'
     $good = Read-Bytes (Join-Path $src 'personal-1.torrent')
@@ -243,7 +283,8 @@ try {
     $cases = @(
         @('404', 'RuTrackerTopicUnavailable'), @('offline', 'RuTrackerUnavailable'),
         @((Join-Path $src 'other.torrent'), 'PersonalHashMismatch'), @((Join-Path $src 'public.torrent'), 'PersonalAnnounceMissing'),
-        @((Join-Path $src 'cut.torrent'), 'PersonalTorrentInvalid'))
+        @((Join-Path $src 'cut.torrent'), 'PersonalTorrentInvalid'), @((Join-Path $src 'mixed-foreign-keyed.torrent'), 'PersonalTrackersUnexpected'),
+        @((Join-Path $src 'foreign-announce.torrent'), 'PersonalAnnounceMissing'))
     foreach ($case in $cases) {
         Reset-Login
         $script:route.dl = $case[0]

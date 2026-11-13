@@ -10,11 +10,20 @@
 # Passwords, cookies and announce keys are never written to logs, reports or the autoload journal.
 $script:RuTrackerForum = 'https://rutracker.org/forum/'
 $script:PublicAnnounce = 'http://bt.t-ru.org/ann?magnet'
+# RuTracker tracker servers: host bt, bt2, bt3, ... (number not fixed) on a confirmed domain, path exactly /ann.
+#   t-ru.org      - bt.t-ru.org is the public announce of the GitHub metadata cache; bt..bt4.t-ru.org are RuTracker's
+#                   tracker hosts;
+#   rutracker.cx  - personal announce of a real .torrent downloaded from the user's account (bt2.rutracker.cx/ann?kk=);
+#   rutracker.org - historical bt*.rutracker.org announces.
+# A domain is added here only after it is seen in a real file from rutracker.org. Unknown servers fail closed.
+$script:RuTrackerTrackerDomains = @('t-ru.org', 'rutracker.cx', 'rutracker.org')
+# Keyless tracker RuTracker itself adds to its .torrent files (local ISP retracker); allowed next to the personal one.
+$script:NeutralTrackerHosts = @('retracker.local')
 $script:RuTrackerSecrets = New-Object Collections.Generic.List[string]
 # At most one automatic login per this many minutes (repeated logins are what makes RuTracker ask for a CAPTCHA).
 $script:RuTrackerLoginPauseMinutes = 30
 $script:RuTrackerProxy = ''
-$script:RuTrackerCodes = @('RuTrackerNotConfigured','RuTrackerCredentialUnreadable','RuTrackerProxyInvalid','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
+$script:RuTrackerCodes = @('RuTrackerNotConfigured','RuTrackerCredentialUnreadable','RuTrackerProxyInvalid','PersonalTrackersUnexpected','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
     'RuTrackerUnavailable','RuTrackerTopicUnavailable','PersonalTorrentInvalid','PersonalHashMismatch','PersonalAnnounceMissing','LocalAppDataMissing')
 
 function Add-RuTrackerSecret([string]$Value) { if ($Value -and $Value.Length -ge 4 -and !$script:RuTrackerSecrets.Contains($Value)) { $script:RuTrackerSecrets.Add($Value) } }
@@ -45,33 +54,54 @@ function Get-PersonalTorrentDirectory {
     return (Join-Path $env:LOCALAPPDATA 'TorrentControl\personal')
 }
 
-# --- Announce analysis (no assumption about pk/kk names, key length or server number) -------------------
+# --- Announce analysis -----------------------------------------------------------------------------------
+# Personal = RuTracker server (see RuTrackerTrackerDomains) + path /ann + only name=value parameters with non-empty
+# values. Parameter names (kk, pk, ...) and key length are not fixed. A query on any other host never makes a URL
+# personal: https://example.com/announce?id=123 is a foreign tracker.
 function Get-AnnounceInfo([string]$Url) {
+    $none = [pscustomobject]@{ valid = $false; host = ''; rutracker = $false; personal = $false; public = $false; neutral = $false; keys = @() }
     $uri = $null
-    $valid = ([Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -and $uri.Scheme -in @('http', 'https') -and
-        !$uri.UserInfo -and !$uri.Fragment -and $uri.Host -match '^[A-Za-z0-9.-]{1,253}$')
-    if (!$valid) { return [pscustomobject]@{ valid = $false; host = ''; personal = $false; public = $false } }
-    $query = $uri.Query.TrimStart('?')
+    if (![Uri]::TryCreate($Url, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @('http', 'https') -or $uri.UserInfo -or
+        $uri.Fragment -or $uri.Host -notmatch '^[A-Za-z0-9.-]{1,253}$' -or $Url -match '[\s\\]') { return $none }
+    $hostName = $uri.Host.ToLowerInvariant()
+    $query = ''
+    if ($Url.Contains('?')) { $query = $Url.Substring($Url.IndexOf('?') + 1) }
+    $pairs = @(); if ($query) { $pairs = @($query.Split('&')) }
+    # Values of every name=value pair are treated as secrets (masked in any text), whatever the host.
+    $keys = @(foreach ($pair in $pairs) { if ($pair -match '^[^=]*=(.+)$') { $Matches[1] } })
+    $domains = @($script:RuTrackerTrackerDomains | ForEach-Object { [regex]::Escape($_) }) -join '|'
+    # Checked on the text itself: no port, no other path, no lookalike suffix such as bt2.rutracker.cx.example.com.
+    $rutracker = ($Url -match ('^https?://bt[0-9]{0,2}\.(' + $domains + ')/ann(\?.*)?$'))
     $personal = $false
-    foreach ($pair in $query.Split('&')) { if ($pair -match '^[A-Za-z0-9_]{1,32}=[^=&]+$') { $personal = $true } }
-    [pscustomobject]@{ valid = $true; host = $uri.Host.ToLowerInvariant(); personal = $personal; public = ($Url -eq $script:PublicAnnounce -or $query -eq 'magnet') }
+    if ($rutracker -and $pairs.Count) {
+        $personal = $true
+        foreach ($pair in $pairs) { if ($pair -notmatch '^[A-Za-z][A-Za-z0-9_]{0,31}=[^&=#"''<>]{1,512}$') { $personal = $false } }
+    }
+    [pscustomobject]@{ valid = $true; host = $hostName; rutracker = $rutracker; personal = $personal
+        public = ($rutracker -and $query -eq 'magnet'); neutral = ($hostName -in $script:NeutralTrackerHosts -and !$query); keys = $keys }
+}
+function Get-TrackerSetInfo($Urls) {
+    # Counts: personal RuTracker, public RuTracker, neutral (retracker.local), other (foreign, unknown or malformed).
+    $set = [ordered]@{ personal = 0; public = 0; neutral = 0; other = 0; host = '' }
+    foreach ($url in @($Urls)) {
+        $info = Get-AnnounceInfo ([string]$url)
+        foreach ($key in @($info.keys)) { Add-RuTrackerSecret $key }
+        if ($info.personal) { $set.personal++; if (!$set.host) { $set.host = $info.host } }
+        elseif ($info.public) { $set.public++ }
+        elseif ($info.neutral) { $set.neutral++ }
+        else { $set.other++ }
+    }
+    return [pscustomobject]$set
 }
 function Get-TorrentTrackerInfo([string]$Path) {
     if (!('TorrentMetadata' -as [type])) { Add-Type -Path "$PSScriptRoot\TorrentMetadata.cs" }
     $tiers = @([TorrentMetadata]::ReadTrackers($Path))
-    $hostName = ''; $personal = $false; $public = $false
-    foreach ($tier in $tiers) {
-        foreach ($url in @($tier)) {
-            $info = Get-AnnounceInfo ([string]$url)
-            if ($info.public) { $public = $true }
-            if ($info.personal -and !$info.public -and !$personal) { $personal = $true; $hostName = $info.host }
-            if ($info.personal) { foreach ($pair in ([Uri]$url).Query.TrimStart('?').Split('&')) { Add-RuTrackerSecret ($pair -replace '^[^=]*=', '') } }
-        }
-    }
-    [pscustomobject]@{ tiers = $tiers; host = $hostName; personal = $personal; public = $public }
+    $set = Get-TrackerSetInfo @(foreach ($tier in $tiers) { foreach ($url in @($tier)) { [string]$url } })
+    [pscustomobject]@{ tiers = $tiers; host = $set.host; personal = $set.personal; public = $set.public; other = $set.other }
 }
 function Test-PersonalTorrent([string]$Path, [string]$ExpectedHash) {
-    # Same infohash as the feed, valid file list, and a personal (account-bound) announce.
+    # Same infohash as the feed, valid file list, at least one personal RuTracker announce, and nothing else
+    # except the neutral retracker: a public RuTracker or a foreign tracker in the file stops (fail-closed).
     if (!('TorrentMetadata' -as [type])) { Add-Type -Path "$PSScriptRoot\TorrentMetadata.cs" }
     $size = 0L
     try { $size = [TorrentMetadata]::Verify($Path, $ExpectedHash) }
@@ -81,8 +111,9 @@ function Test-PersonalTorrent([string]$Path, [string]$ExpectedHash) {
     }
     $trackers = $null
     try { $trackers = Get-TorrentTrackerInfo $Path } catch { throw 'PersonalTorrentInvalid' }
-    if (!$trackers.personal) { throw 'PersonalAnnounceMissing' }
-    [pscustomobject]@{ size = $size; host = $trackers.host; tiers = $trackers.tiers; public = $trackers.public }
+    if ($trackers.personal -lt 1) { throw 'PersonalAnnounceMissing' }
+    if ($trackers.public -or $trackers.other) { throw 'PersonalTrackersUnexpected' }
+    [pscustomobject]@{ size = $size; host = $trackers.host; tiers = $trackers.tiers }
 }
 
 # --- HTTP (one function, replaced by stubs in tests) ---------------------------------------------------

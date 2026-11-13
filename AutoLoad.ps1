@@ -9,7 +9,7 @@
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
-    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing)|LocalAppDataMissing)$') {return $Exception.Message}
+    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing|TrackersUnexpected)|LocalAppDataMissing)$') {return $Exception.Message}
     if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
 }
@@ -158,7 +158,8 @@ function Write-AutoReport($State,[string]$Directory) {
         RuTrackerAuthExpired='Сессия RuTracker не действует; повтор при следующем опросе. Публичная версия не добавляется.'
         RuTrackerUnavailable='RuTracker недоступен; повтор при следующем опросе. Публичная версия не добавляется.'
         RuTrackerTopicUnavailable='Тема недоступна на RuTracker; повтор при следующем опросе.'
-        PersonalAnnounceMissing='В полученном .torrent нет персонального адреса трекера; публичная версия не добавляется.'
+        PersonalAnnounceMissing='В полученном .torrent нет персонального адреса подтверждённого сервера RuTracker (bt*.t-ru.org, bt*.rutracker.cx, bt*.rutracker.org); публичная версия не добавляется.'
+        PersonalTrackersUnexpected='В полученном .torrent кроме персонального адреса есть публичный или посторонний трекер; файл не добавляется, нужна проверка.'
         PersonalTorrentInvalid='Полученный .torrent повреждён; повтор при следующем опросе.'
         TopicHashChanged='Раздача в теме перезалита: хеш не совпадает с лентой. Старая версия не добавляется.'
     }

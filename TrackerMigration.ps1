@@ -42,15 +42,13 @@ function ConvertTo-TrackerText($Tiers) {
     return (@(foreach ($tier in @($Tiers)) { (@($tier) -join "`r`n") }) -join "`r`n`r`n")
 }
 function Get-TrackerClass([string]$Text) {
+    # Public: only the public RuTracker announce (what TorrentControl used to add). Personal: at least one personal
+    # RuTracker announce and otherwise only the neutral retracker. Anything else (foreign trackers, mixed public and
+    # personal, unknown servers) is Unexpected and never changed.
     $lines = @(Get-TrackerLines $Text)
-    if (!$lines.Count) { return [pscustomobject]@{ kind = 'Unexpected'; host = '' } }
-    $public = 0; $hostName = ''
-    foreach ($line in $lines) {
-        $info = Get-AnnounceInfo $line
-        if ($info.public) { $public++ } elseif ($info.personal -and !$hostName) { $hostName = $info.host }
-    }
-    if ($public -eq $lines.Count) { return [pscustomobject]@{ kind = 'Public'; host = '' } }
-    if ($hostName -and $public -eq 0) { return [pscustomobject]@{ kind = 'Personal'; host = $hostName } }
+    $set = Get-TrackerSetInfo $lines
+    if ($lines.Count -and $set.public -eq $lines.Count) { return [pscustomobject]@{ kind = 'Public'; host = '' } }
+    if ($set.personal -and !$set.public -and !$set.other) { return [pscustomobject]@{ kind = 'Personal'; host = $set.host } }
     return [pscustomobject]@{ kind = 'Unexpected'; host = '' }
 }
 function Test-PathInside([string]$Path, [string]$Folder) {
@@ -108,7 +106,8 @@ function Invoke-TrackerMigration {
         return [pscustomobject]@{ mode = $Mode; verified = 1 }
     }
     if ($Mode -eq 'Batch' -and !@($journal.entries | Where-Object { $_.status -eq 'Verified' }).Count) { throw 'BatchNeedsVerifiedMigration' }
-    $data = Fetch-List $Config $Credential
+    $data = $null
+    try { $data = Fetch-List $Config $Credential } catch { throw 'WebUIRequestFailed' }
     $rows = @($data.torrents)
     $problem = Get-TorrentListProblem $rows
     if ($problem) { throw "ClientDataInvalid:$problem" }
@@ -122,7 +121,9 @@ function Invoke-TrackerMigration {
         $answer = [string](& $Confirm ('Введите YES BATCH, чтобы перепривязать до ' + $owned.Count + ' раздач TorrentControl по одной, с остановкой на первой проблеме'))
         if ($answer.Trim() -ne 'YES BATCH') { throw 'BatchCancelled' }
     }
-    $context = New-WebUIContext $Config $Credential
+    # WebUI errors become a fixed code: an exception text could quote a request URL that holds the personal key.
+    $context = $null
+    try { $context = New-WebUIContext $Config $Credential } catch { throw 'WebUIRequestFailed' }
     $summary = [ordered]@{ mode = $Mode; planned = 0; applied = 0; already = 0; skipped = 0; waiting = 0; failed = 0; cancelled = 0 }
     foreach ($item in $owned) {
         $hash = ([string]$item.hash).ToUpperInvariant()
@@ -135,12 +136,19 @@ function Invoke-TrackerMigration {
         if ($null -ne $row) { $actual = Get-AutoPath $row $paths }
         if ($null -eq $row) { $entry.status = 'Skipped'; $entry.reason = 'NotInClient'; $summary.skipped++; continue }
         if (!$actual -or !(Test-PathInside $actual ([string]$item.path))) { $entry.status = 'Skipped'; $entry.reason = 'PathMismatch'; $summary.skipped++; continue }
-        $class = Get-TrackerClass (Get-WebUITrackers $context $hash)
+        $current = $null
+        try { $current = Get-WebUITrackers $context $hash } catch { $current = $null }
+        if ($null -eq $current) { $entry.status = 'Failed'; $entry.reason = 'WebUIRequestFailed'; $summary.failed++; break }
+        $class = Get-TrackerClass $current
         if ($class.kind -eq 'Personal') {
-            if ($entry.status -notin @('Applied', 'Verified')) { $entry.status = 'AlreadyPersonal'; $entry.reason = '' }
-            $entry.tracker = $class.host; $summary.already++; continue
+            if ($entry.status -notin @('Applied', 'Verified')) { $entry.status = 'AlreadyPersonal' }
+            $entry.reason = ''; $entry.tracker = $class.host; $summary.already++; continue
         }
-        if ($class.kind -ne 'Public') { $entry.status = 'Skipped'; $entry.reason = 'UnexpectedTrackers'; $summary.skipped++; continue }
+        if ($class.kind -ne 'Public') {
+            # An applied or verified record keeps its status; the reason shows that the trackers changed since.
+            if ($entry.status -notin @('Applied', 'Verified')) { $entry.status = 'Skipped' }
+            $entry.reason = 'UnexpectedTrackers'; $summary.skipped++; continue
+        }
         $personal = $null
         try { $personal = Get-PersonalTorrent $Directory ([string]$item.topic) $hash }
         catch {
@@ -164,11 +172,16 @@ function Invoke-TrackerMigration {
         $before = @($row[3], $row[4], $row[18], $actual)
         $entry.status = 'Applying'; $entry.reason = ''
         Save-MigrationJournal $journal $Directory   # recorded before the change
-        Set-WebUITrackers $context $hash $text
-        $readBack = @(Get-TrackerLines (Get-WebUITrackers $context $hash))
+        $readText = $null
+        try { Set-WebUITrackers $context $hash $text; $readText = Get-WebUITrackers $context $hash } catch { $readText = $null }
+        if ($null -eq $readText) { $entry.status = 'Failed'; $entry.reason = 'WebUIRequestFailed'; $summary.failed++; break }
+        $readBack = @(Get-TrackerLines $readText)
         $wanted = @(Get-TrackerLines $text)
         if (($readBack -join "`n") -ne ($wanted -join "`n")) { $entry.status = 'Failed'; $entry.reason = 'ReadBackMismatch'; $summary.failed++; break }
-        $after = Find-AutoRow @((Fetch-List $Config $Credential).torrents) $hash
+        $fresh = $null
+        try { $fresh = Fetch-List $Config $Credential } catch { $fresh = $null }
+        if ($null -eq $fresh) { $entry.status = 'Failed'; $entry.reason = 'WebUIRequestFailed'; $summary.failed++; break }
+        $after = Find-AutoRow @($fresh.torrents) $hash
         $afterPath = ''
         if ($null -ne $after) { $afterPath = Get-AutoPath $after (Read-LocalPaths) }
         if ($null -eq $after -or $afterPath -ne $before[3] -or $after[3] -ne $before[0] -or $after[4] -ne $before[1] -or $after[18] -ne $before[2] -or (([long]$after[1]) -band 2)) {
