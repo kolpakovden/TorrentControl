@@ -24,3 +24,10 @@ metadata-probe/
 tests/autoload-test-*/
 __pycache__/
 *.bak
+rutracker-credential.xml
+rutracker-proxy.txt
+rutracker-session.xml
+rutracker-state.json
+tracker-migration.json
+tracker-migration.html
+tracker-migration.csv

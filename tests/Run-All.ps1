@@ -12,6 +12,13 @@ function Get-LocalSnapshot {
     return $snapshot
 }
 $before = Get-LocalSnapshot
+# Personal RuTracker files of this Windows user: tests redirect LOCALAPPDATA and must never touch the real folder.
+function Get-ProfileSnapshot {
+    $folder = if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'TorrentControl' } else { '' }
+    if (!$folder -or !(Test-Path -LiteralPath $folder)) { return '' }
+    return (@(Get-ChildItem -LiteralPath $folder -Recurse -File -Force | ForEach-Object { $_.FullName + '|' + $_.Length + '|' + $_.LastWriteTimeUtc.Ticks }) -join "`n")
+}
+$profileBefore = Get-ProfileSnapshot
 $probe = 'D:\Фильмы'
 $probeBefore = @()
 if (Test-Path -LiteralPath $probe) { $probeBefore = @(Get-ChildItem -LiteralPath $probe -Directory -Filter 'rt-9000000*' | ForEach-Object Name) }
@@ -22,6 +29,7 @@ foreach ($test in @(Get-ChildItem -LiteralPath $PSScriptRoot -Filter 'Test-*.ps1
     if ($LASTEXITCODE -ne 0) { $failed += $test.Name; Write-Host "FAIL: $($test.Name) (exit $LASTEXITCODE)" -ForegroundColor Red }
 }
 $after = Get-LocalSnapshot
+if ((Get-ProfileSnapshot) -ne $profileBefore) { $failed += 'profile-guard'; Write-Host 'FAIL: files under %LOCALAPPDATA%\TorrentControl changed during the run.' -ForegroundColor Red }
 $changed = @(@($before.Keys) + @($after.Keys) | Select-Object -Unique | Where-Object { $before[$_] -ne $after[$_] })
 if ($changed.Count) {
     $failed += 'local-files-guard'

@@ -56,3 +56,33 @@ function Remove-TestDirectory([string]$Path) {
     }
 }
 function Get-FileText([string]$Path) { return [IO.File]::ReadAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path)) }
+# --- Fake .torrent files (offline; no real passkeys anywhere in the tests) ------------------------------
+function Write-TestBencode($Stream, $Value) {
+    if ($Value -is [byte[]]) { $head = [Text.Encoding]::ASCII.GetBytes("$($Value.Length):"); $Stream.Write($head, 0, $head.Length); $Stream.Write($Value, 0, $Value.Length); return }
+    if ($Value -is [string]) { Write-TestBencode $Stream ([Text.Encoding]::UTF8.GetBytes($Value)); return }
+    if ($Value -is [int] -or $Value -is [long]) { $b = [Text.Encoding]::ASCII.GetBytes("i$($Value)e"); $Stream.Write($b, 0, $b.Length); return }
+    if ($Value -is [Collections.IDictionary]) { $Stream.WriteByte(100); foreach ($key in @($Value.Keys)) { Write-TestBencode $Stream ([string]$key); Write-TestBencode $Stream $Value[$key] }; $Stream.WriteByte(101); return }
+    if ($Value -is [Collections.IList]) { $Stream.WriteByte(108); foreach ($item in $Value) { Write-TestBencode $Stream $item }; $Stream.WriteByte(101); return }
+    throw 'Unsupported bencode value'
+}
+function ConvertTo-TestBencode($Value) { $ms = New-Object IO.MemoryStream; Write-TestBencode $ms $Value; return ,$ms.ToArray() }
+function Get-TestSha1([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA1]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '') } finally { $sha.Dispose() }
+}
+function New-TestInfo([string]$Name = 'Film.mkv', [long]$Length = 58, [string]$Salt = '') {
+    $pieces = New-Object byte[] 20
+    if ($Salt) { $pieces[0] = [byte]($Salt.Length % 251 + 1) }
+    return [ordered]@{ length = $Length; name = $Name + $Salt; 'piece length' = 16384; pieces = $pieces }
+}
+function New-TestTorrentFile([string]$Path, $Info, [string]$Announce = '', $Tiers = $null) {
+    # Keys in sorted order like real files; returns the infohash.
+    $top = [ordered]@{}
+    if ($Announce) { $top['announce'] = $Announce }
+    if ($null -ne $Tiers) { $top['announce-list'] = @(foreach ($tier in $Tiers) { ,@($tier) }) }
+    $top['comment'] = 'https://rutracker.org/forum/viewtopic.php?t=6612345'
+    $top['info'] = $Info
+    [IO.File]::WriteAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path), (ConvertTo-TestBencode $top))
+    return (Get-TestSha1 (ConvertTo-TestBencode $Info))
+}
+

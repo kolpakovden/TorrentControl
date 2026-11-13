@@ -9,6 +9,7 @@
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
+    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing)|LocalAppDataMissing)$') {return $Exception.Message}
     if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
 }
@@ -140,7 +141,7 @@ function Set-AutoReviewed($State) {
     return $count
 }
 function Write-AutoReport($State,[string]$Directory) {
-    $labels=@{WaitingMetadata='Ожидает метаданные';NoSpace='Ожидает место';Submitted='Передано клиенту — ждём подтверждение';Confirmed='Добавлено, путь подтверждён';Existing='Уже есть в клиенте';Rejected='Пропущено';NeedsAttention='Нужна проверка';Reviewed='Проверено пользователем'}
+    $labels=@{WaitingMetadata='Ожидает метаданные';NoSpace='Ожидает место';WaitingAuth='Ожидает авторизацию RuTracker';Submitted='Передано клиенту — ждём подтверждение';Confirmed='Добавлено, путь подтверждён';Existing='Уже есть в клиенте';Rejected='Пропущено';NeedsAttention='Нужна проверка';Reviewed='Проверено пользователем'}
     $reasons=@{
         UnexpectedClientPath='Путь в µTorrent не совпал с папкой автозагрузки. Раздача НЕ остановлена: принадлежность не доказана — проверьте её вручную.'
         NotSeenInClient='µTorrent не показал раздачу в течение 2 часов после передачи. Повторная передача не выполняется.'
@@ -149,13 +150,24 @@ function Write-AutoReport($State,[string]$Directory) {
         FoundInResumeDat='Найдено в resume.dat µTorrent'
         ClientListUnstable='Список µTorrent изменился во время проверки; повтор при следующем опросе'
         ClientDataInvalid='µTorrent вернул некорректные данные; отправка отложена до корректного списка'
+        RuTrackerNotConfigured='Вход в RuTracker не настроен: запустите 9-RuTracker-login.cmd. Публичная версия не добавляется.'
+        RuTrackerCredentialUnreadable='Сохранённый вход RuTracker не читается этой учётной записью Windows: запустите 9-RuTracker-login.cmd под пользователем, от имени которого работает монитор. Публичная версия не добавляется.'
+        RuTrackerProxyInvalid='Файл rutracker-proxy.txt должен содержать одну строку вида http://адрес:порт. Публичная версия не добавляется.'
+        RuTrackerCaptchaRequired='RuTracker просит CAPTCHA: запустите 9-RuTracker-login.cmd и введите код. Публичная версия не добавляется.'
+        RuTrackerLoginFailed='RuTracker не принял логин или пароль: запустите 9-RuTracker-login.cmd. Публичная версия не добавляется.'
+        RuTrackerAuthExpired='Сессия RuTracker не действует; повтор при следующем опросе. Публичная версия не добавляется.'
+        RuTrackerUnavailable='RuTracker недоступен; повтор при следующем опросе. Публичная версия не добавляется.'
+        RuTrackerTopicUnavailable='Тема недоступна на RuTracker; повтор при следующем опросе.'
+        PersonalAnnounceMissing='В полученном .torrent нет персонального адреса трекера; публичная версия не добавляется.'
+        PersonalTorrentInvalid='Полученный .torrent повреждён; повтор при следующем опросе.'
+        TopicHashChanged='Раздача в теме перезалита: хеш не совпадает с лентой. Старая версия не добавляется.'
     }
     $rows=@($State.items | ForEach-Object {
         $reason=[string]$_.reason
         if ($reasons.ContainsKey($reason)) {$reason=$reasons[$reason]}
-        [pscustomobject]@{Статус=$labels[[string]$_.status];Название=$_.title;ГиБ=[math]::Round([double]$_.bytes/1GB,2);Путь=$_.path;Причина=$reason;Hash=$_.hash}
+        [pscustomobject]@{Статус=$labels[[string]$_.status];Название=$_.title;ГиБ=[math]::Round([double]$_.bytes/1GB,2);Путь=$_.path;Трекер=[string]$_.tracker;Причина=$reason;Hash=$_.hash}
     })
-    $intro='<h1>Автозагрузка фильмов</h1><p>Обновлено: '+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')+'</p><p>Новые темы после включения; WEB-DL/WEB-DLRip/BDRip, Dub/MVO/DVO. Папка D:\Фильмы, запас 20 ГиБ, максимум одно добавление за опрос. Удаление отключено. Автозагрузка никогда не останавливает и не удаляет раздачи.</p><p>«Нужна проверка» блокирует следующие добавления. После проверки в µTorrent запустите 8-Review-autoload.cmd.</p>'
+    $intro='<h1>Автозагрузка фильмов</h1><p>Обновлено: '+(Get-Date -Format 'yyyy-MM-dd HH:mm:ss')+'</p><p>Новые темы после включения; WEB-DL/WEB-DLRip/BDRip, Dub/MVO/DVO. Папка D:\Фильмы, запас 20 ГиБ, максимум одно добавление за опрос. Удаление отключено. Автозагрузка никогда не останавливает и не удаляет раздачи. Новые раздачи добавляются только с персональным .torrent RuTracker (столбец «Трекер» — сервер статистики, без ключа).</p><p>«Нужна проверка» блокирует следующие добавления. После проверки в µTorrent запустите 8-Review-autoload.cmd.</p>'
     $rows | ConvertTo-Html -Head '<meta charset="utf-8"><style>body{font:15px Segoe UI;margin:24px}td,th{border:1px solid #ddd;padding:8px}table{border-collapse:collapse}</style>' -PreContent $intro | Set-Content "$Directory\auto-downloads.html" -Encoding UTF8
 }
 function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Directory) {
@@ -214,7 +226,7 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
         if (@($state.items | Where-Object {$_.status -in @('Submitted','NeedsAttention')}).Count) {return 'Автозагрузка ждёт подтверждения предыдущего добавления или проверки пользователем; см. журнал автозагрузки.'}
         if (!@($Rows).Count) {return 'Автозагрузка ждёт: µTorrent вернул пустой список раздач.'}
         $examined=0
-        foreach($item in @($state.items | Where-Object {$_.status -in @('WaitingMetadata','NoSpace')} | Sort-Object lastAttempt)) {
+        foreach($item in @($state.items | Where-Object {$_.status -in @('WaitingMetadata','NoSpace','WaitingAuth')} | Sort-Object lastAttempt)) {
             if (++$examined -gt 3) {break}
             $item.lastAttempt=[DateTimeOffset]::UtcNow.ToString('o')
             $presence=Get-AutoPresence $Rows $Paths $item.hash
@@ -231,7 +243,7 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
                 if (!('TorrentMetadata' -as [type])) {Add-Type -Path "$PSScriptRoot\TorrentMetadata.cs"}
                 $size=[TorrentMetadata]::Verify($torrent,$item.hash)
                 if ($size -le 0 -or $size -ne [long]$meta.total_bytes) {throw 'MetadataSizeMismatch'}
-                [TorrentMetadata]::Sanitize($torrent,$item.hash)
+                # The public metadata only proves size and file names in advance; it is never submitted.
                 $item.bytes=$size
             } catch {$item.status='Rejected';$item.reason='MetadataOrPathValidationFailed';continue}
             # Refresh before mutation: includes any manual additions since the monitor started.
@@ -250,6 +262,20 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
             $Rows=$freshRows
             $budget=Get-AutoBudget $Rows $Paths (Get-AutoFreeBytes) ([double]$settings.reserveGiB*1GB)
             if ($size -gt $budget) {$item.status='NoSpace';$item.reason='ReservedForCurrentDownloads';continue}
+            # The personal .torrent from the user's own RuTracker session (RuTracker.ps1): same infohash as the feed,
+            # personal announce. Without it nothing is added - never the public magnet version.
+            $personal=$null
+            try {$personal=Get-PersonalTorrent $Directory $item.topic $item.hash}
+            catch {
+                $code=Get-AutoErrorCode $_.Exception
+                if ($code -eq 'PersonalHashMismatch') {$item.status='Rejected';$item.reason='TopicHashChanged';continue}
+                if ($code -eq 'SeeClientAndConfiguration') {$code='RuTrackerUnavailable'}
+                $item.status='WaitingAuth';$item.reason=$code
+                return ('Автозагрузка ждёт персональный .torrent RuTracker (' + $code + '); публичная версия не добавляется.')
+            }
+            $torrent=$personal.path
+            $item | Add-Member -NotePropertyName tracker -NotePropertyValue ([string]$personal.host) -Force
+            $item | Add-Member -NotePropertyName trackerKind -NotePropertyValue 'Personal' -Force
             # Plain concatenation: the destination is fixed and validated; Join-Path would require drive D: to be mounted in PowerShell.
             $target=$settings.destination+'\rt-'+$item.topic
             Assert-AutoDirectory $target

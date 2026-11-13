@@ -118,17 +118,36 @@ public sealed class TorrentMetadata {
         } else { size=(long)info["length"]; if(size<0) throw new FormatException("Negative size"); }
         return size;
     }
-    public static void Sanitize(string path, string expectedHash) {
-        Verify(path,expectedHash);
-        byte[] raw=File.ReadAllBytes(path); var parser=new TorrentMetadata(raw); parser.Read(0);
-        // Top-level URLs are outside the infohash. Keep only verified info and the known public tracker.
-        string tracker="http://bt.t-ru.org/ann?magnet";
-        byte[] head=Encoding.ASCII.GetBytes("d8:announce"+tracker.Length+":"+tracker+"4:info");
-        using(var stream=new MemoryStream()) {
-            stream.Write(head,0,head.Length);
-            stream.Write(raw,parser.infoStart,parser.infoEnd-parser.infoStart);
-            stream.WriteByte((byte)'e');
-            File.WriteAllBytes(path,stream.ToArray());
+    static string TrackerUrl(object value) {
+        var raw=value as byte[];
+        if(raw==null) throw new FormatException("Tracker type");
+        string url=new UTF8Encoding(false,true).GetString(raw);
+        if(url.Length==0 || url.Length>2048) throw new FormatException("Tracker length");
+        foreach(char c in url) if(c<33 || c>126) throw new FormatException("Unsafe tracker URL");
+        return url;
+    }
+    // Tracker tiers exactly as stored in the file: announce-list if present, otherwise announce.
+    // The file itself is never rewritten: a personal announce must reach uTorrent unchanged.
+    public static string[][] ReadTrackers(string path) {
+        var fi=new FileInfo(path);
+        if (fi.Length>4000000) throw new FormatException("Metadata too large");
+        byte[] raw=File.ReadAllBytes(path);
+        var parser=new TorrentMetadata(raw);
+        var top=parser.Read(0) as Dictionary<string,object>;
+        if(top==null || parser.pos!=raw.Length) throw new FormatException("Invalid torrent");
+        var tiers=new List<string[]>();
+        if(top.ContainsKey("announce-list")) {
+            var list=top["announce-list"] as List<object>;
+            if(list==null || list.Count>64) throw new FormatException("Invalid announce-list");
+            foreach(var item in list) {
+                var tier=item as List<object>;
+                if(tier==null || tier.Count>64) throw new FormatException("Invalid tracker tier");
+                var urls=new List<string>();
+                foreach(var url in tier) urls.Add(TrackerUrl(url));
+                if(urls.Count>0) tiers.Add(urls.ToArray());
+            }
         }
+        if(tiers.Count==0 && top.ContainsKey("announce")) tiers.Add(new[]{ TrackerUrl(top["announce"]) });
+        return tiers.ToArray();
     }
 }
