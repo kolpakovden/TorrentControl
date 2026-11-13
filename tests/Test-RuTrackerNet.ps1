@@ -47,7 +47,8 @@ try {
     $r = [RuTrackerRoute]::Check('127.0.0.1', $silent.Port, 'rutracker.org', '/forum/index.php', 1500)
     Assert ($r.Code -eq 'Timeout' -and $r.Stage -eq 'ProxyTunnel' -and $r.ElapsedMs -lt 8000) "silent proxy: $($r.Code)/$($r.Stage)/$($r.ElapsedMs)"
     $closed = [FakeProxy]::ClosedPort()
-    $r = [RuTrackerRoute]::Check('127.0.0.1', $closed, 'rutracker.org', '/forum/index.php', 3000)
+    # Windows needs about 2 s to report a refused local connection: allow for it.
+    $r = [RuTrackerRoute]::Check('127.0.0.1', $closed, 'rutracker.org', '/forum/index.php', 8000)
     Assert ($r.Code -eq 'ProxyUnreachable' -and $r.Stage -eq 'ProxyConnect') "closed proxy port: $($r.Code)/$($r.Stage)"
     # Direct connection with a DNS failure (reserved name, never resolvable).
     $r = [RuTrackerRoute]::Check('', 0, 'rutracker.invalid', '/forum/index.php', 5000)
@@ -95,7 +96,7 @@ try {
         $started = [DateTime]::UtcNow
         $response = Invoke-RuTrackerHttp 'Get' 'https://rutracker.org/forum/dl.php?t=1' (New-RuTrackerSession 'bb_session=0-FAKE-COOKIE-NET-2')
         Assert ($response.status -eq 0 -and (Get-RuTrackerFailureCode $response.error) -eq 'RuTrackerProxyUnavailable') "$($case[0]) proxy: $($response.error)"
-        Assert (([DateTime]::UtcNow - $started).TotalSeconds -lt 20) "$($case[0]) proxy: no timeout"
+        Assert (([DateTime]::UtcNow - $started).TotalSeconds -lt 12) "$($case[0]) proxy: no timeout ($([int]([DateTime]::UtcNow - $started).TotalSeconds) s)"
     }
     # Only HTTPS to rutracker.org/forum/ and the CAPTCHA host: anything else is refused before any connection.
     $guard = New-FakeProxy 'connect-garbage'
@@ -151,8 +152,12 @@ try {
         if (!$Proxy) { return [RuTrackerRoute]::Check('', 0, 'rutracker.invalid', '/forum/index.php', 5000) }   # direct: DNS failure
         if ($Proxy -eq 'http://127.0.0.1:12334') { return [pscustomobject]@{ Ok = $true; Code = 'Ok'; Stage = 'Http'; ProxyStatus = 200; HttpStatus = 200; TlsErrors = ''; Addresses = 0; ElapsedMs = 420 } }
         $uri = [Uri]$Proxy
-        return [RuTrackerRoute]::Check($uri.Host, $uri.Port, 'rutracker.org', '/forum/index.php', 2000)
+        return [RuTrackerRoute]::Check($uri.Host, $uri.Port, 'rutracker.org', '/forum/index.php', $TimeoutMs)
     }
+    $slow = [pscustomobject]@{ Ok = $false; Code = 'Timeout'; Stage = 'ProxyConnect'; ProxyStatus = 0; HttpStatus = 0; TlsErrors = ''; Addresses = 0; ElapsedMs = 8000 }
+    Assert ((Format-RouteResult $slow 8) -match '^на этом адресе и порту ничего не принимает соединения.*\(нет ответа за 8 с\)') 'timeout at the proxy not explained'
+    $cert = [pscustomobject]@{ Ok = $false; Code = 'TlsCertificateInvalid'; Stage = 'Tls'; ProxyStatus = 200; HttpStatus = 0; TlsErrors = 'RemoteCertificateChainErrors'; Addresses = 0; ElapsedMs = 10 }
+    Assert ((Format-RouteResult $cert 8) -match 'сертификат rutracker\.org не прошёл проверку \(RemoteCertificateChainErrors\)') 'certificate error not explained'
     $diag = Join-Path $temp 'diag'
     $null = Microsoft.PowerShell.Management\New-Item -Path $diag -ItemType Directory
     $report = Invoke-RuTrackerDiagnostics $diag '' -FindLocalProxy 3
@@ -172,7 +177,7 @@ try {
     function Get-ListeningSockets { return ,@() }
     $empty = Join-Path $temp 'empty'
     $null = Microsoft.PowerShell.Management\New-Item -Path $empty -ItemType Directory
-    $report = Invoke-RuTrackerDiagnostics $empty ('http://127.0.0.1:' + $closed) -FindLocalProxy 2
+    $report = Invoke-RuTrackerDiagnostics $empty ('http://127.0.0.1:' + $closed) -FindLocalProxy 8
     $text = $report.lines -join "`n"
     Assert (!$report.working -and $text -match 'ничего не принимает соединения' -and $text -match 'не найдены') "unreachable proxy not explained: $text"
     Assert ($text -match '«Режим службы» → «Только прокси»' -and $text -match '«Порт прокси \(SOCKS5/4, HTTP\)»' -and $text -match 'Внешние прокси из интернета автоматически не предлагаются') 'Hiddify guidance missing'

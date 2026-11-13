@@ -249,14 +249,22 @@ function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$
         $request.Timeout = $script:RuTrackerTimeoutMs
         $request.ReadWriteTimeout = $script:RuTrackerTimeoutMs
         $request.UserAgent = $script:RuTrackerUserAgent
+        # Timeouts are enforced here: .NET Framework does not apply HttpWebRequest.Timeout while it waits for the
+        # proxy's answer to CONNECT, so a silent proxy would otherwise hang the request.
         if ($Form) {
             $body = [Text.Encoding]::ASCII.GetBytes($Form)
             $request.ContentType = 'application/x-www-form-urlencoded'
             $request.ContentLength = $body.Length
-            $upload = $request.GetRequestStream()
+            $pending = $request.BeginGetRequestStream($null, $null)
+            if (!$pending.AsyncWaitHandle.WaitOne($script:RuTrackerTimeoutMs)) { $request.Abort(); return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
+            $upload = $request.EndGetRequestStream($pending)
             try { $upload.Write($body, 0, $body.Length) } finally { $upload.Dispose() }
         }
-        try { $response = $request.GetResponse() }
+        try {
+            $pending = $request.BeginGetResponse($null, $null)
+            if (!$pending.AsyncWaitHandle.WaitOne($script:RuTrackerTimeoutMs)) { $request.Abort(); return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
+            $response = $request.EndGetResponse($pending)
+        }
         catch {
             $web = $_.Exception
             while ($null -ne $web -and $web -isnot [Net.WebException]) { $web = $web.InnerException }

@@ -30,6 +30,8 @@ $script:StageTexts = @{ Dns = 'DNS'; Connect = 'подключение к rutrac
 
 function Format-RouteResult($Result, [int]$TimeoutSec) {
     $template = $script:RouteTexts[[string]$Result.Code]
+    # No answer while connecting to the proxy has the same practical causes as a refused connection.
+    if ($Result.Code -eq 'Timeout' -and $Result.Stage -eq 'ProxyConnect') { $template = $script:RouteTexts.ProxyUnreachable + ' (нет ответа за {1} с)' }
     if (!$template) { $template = 'ошибка ({0})' }
     $text = $template -f $Result.ProxyStatus, $TimeoutSec, $script:StageTexts[[string]$Result.Stage], $Result.TlsErrors, $Result.HttpStatus
     if ($Result.Ok) { $text += ' (HTTP ' + $Result.HttpStatus + ', TLS и сертификат в порядке)' }
