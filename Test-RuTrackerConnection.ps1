@@ -17,6 +17,7 @@
 #                                 -NoAddressProbe skips that.
 # The report is shown and saved to rutracker-connection.txt (no secrets in it).
 $ErrorActionPreference = 'Stop'
+. "$PSScriptRoot\AutoLoad.ps1"
 . "$PSScriptRoot\RuTracker.ps1"
 
 $script:RouteTexts = @{
