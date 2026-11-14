@@ -43,7 +43,7 @@ try {
     $route = $script:RuTrackerLastRoute
     $detail = 'TLS'
     if ($route -and $route.TlsVersion) { $detail = [string]$route.TlsVersion }
-    if ($route -and [int]$route.Attempts -gt 0) { $detail += '; адрес прокси ' + $route.Endpoint }
+    if ($route -and [int]$route.Attempts -gt 0) { $detail += '; адрес прокси ' + $route.Endpoint + ', попыток ' + $route.Attempts + ' из ' + $route.Addresses }
     Write-Host ('Соединение с rutracker.org проверено (' + $detail + ', сертификат rutracker.org действителен).')
     if (!$Check) {
         Write-Host 'Вход в RuTracker для персональных .torrent. Пароль хранится зашифрованным для этой учётной записи Windows (DPAPI)'

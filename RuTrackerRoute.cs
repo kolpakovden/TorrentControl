@@ -23,14 +23,19 @@ using System.Threading;
 //   and rutracker.org behind the official proxy accepts only TLS 1.3. Its certificate must build a Windows X509Chain
 //   to a root trusted on this computer, with the serverAuth usage, valid dates and the host name; nothing relaxes it.
 // The proxy sees "host:443" only; paths, cookies and passwords travel inside the TLS session with the host.
-// A proxy name with several addresses: up to 3 are tried in turn, each attempt ends before any byte of the request
-// is sent, and none follows a rejected certificate or a proxy password request. One request per connection,
-// redirects are never followed here, sizes are bounded, and a request (all addresses, handshakes and the answer)
-// never runs longer than 3 timeouts: then its sockets are closed and it ends with Timeout. Nothing is changed in Windows, DNS, routes or proxy
-// settings.
+// A proxy name with several addresses (ps1.blockme.site: 9, only some of them work at a time): DNS is asked every
+// time; the caller (RuTracker.ps1) gives the order it learned - addresses that worked most recently first, then the
+// unknown ones in DNS order, then those that failed recently. Only if DNS gives nothing are the remembered addresses
+// used. Every address is tried while the time of the request allows (short handshake timeout per address), each
+// attempt ends before any byte of the request is sent, and none follows a rejected certificate (of the proxy or of
+// the site) or a proxy password request. The certificate of an https proxy is always checked for the proxy NAME,
+// whichever address is used. One request per connection, redirects are never followed here, sizes are bounded, and
+// a request (all addresses, handshakes and the answer) never runs longer than 3 timeouts: then its sockets are closed
+// and it ends with Timeout. Nothing is changed in Windows, DNS, routes or proxy settings.
 public sealed class RuTrackerRouteResult {
     public bool Ok;
-    public string Code = "";        // Ok, DnsFailed, ConnectFailed, ProxyUnreachable, ProxyTlsFailed, ProxyAuthRequired,
+    public string Code = "";        // Ok, DnsFailed, ConnectFailed, ProxyUnreachable, ProxyTlsFailed (network failure in the
+                                    // handshake with the proxy), ProxyCertificateInvalid, ProxyAuthRequired,
                                     // ProxyRefused, ProxyUnsupported, Timeout, TlsFailed, TlsCertificateInvalid,
                                     // HttpForbidden, HttpRateLimited, HttpUnexpected
     public string Stage = "";       // Dns, Connect, ProxyConnect, ProxyTls, ProxyTunnel, Tls, Http
@@ -42,6 +47,10 @@ public sealed class RuTrackerRouteResult {
     public int Attempts;            // proxy addresses tried
     public string Endpoint = "";    // address:port of the last connection (the proxy, or the host when direct)
     public string TlsVersion = "";  // TLS version with the host ("TLS 1.3" / "TLS 1.2")
+    public string AddressSource = "";                 // dns, cache (DNS gave nothing: remembered addresses), fixed
+    public string[] DnsAddresses = new string[0];     // what DNS returned for the proxy name
+    public string[] AttemptAddresses = new string[0]; // proxy addresses in the order tried
+    public string[] AttemptCodes = new string[0];     // Ok or the failure code of each of them
     public long ElapsedMs;
 }
 
@@ -55,6 +64,11 @@ public sealed class RuTrackerHttpResult {
     public string TlsErrors = "";
     public int ProxyStatus;
     public string TlsVersion = "";
+    public string Endpoint = "";
+    public string AddressSource = "";
+    public string[] DnsAddresses = new string[0];
+    public string[] AttemptAddresses = new string[0];
+    public string[] AttemptCodes = new string[0];
 }
 
 public sealed class RuTrackerRouteFailure : Exception {
@@ -75,9 +89,34 @@ public static class RuTrackerRoute {
         return Check(string.IsNullOrEmpty(proxyHost) ? "" : "http", proxyHost, proxyPort, host, path, timeoutMs);
     }
     public static RuTrackerRouteResult Check(string proxyScheme, string proxyHost, int proxyPort, string host, string path, int timeoutMs) {
+        return Check(proxyScheme, proxyHost, proxyPort, host, path, timeoutMs, null, null);
+    }
+    // preferred: proxy addresses to try first (best first); avoid: addresses to try last (both from RuTracker.ps1).
+    public static RuTrackerRouteResult Check(string proxyScheme, string proxyHost, int proxyPort, string host, string path, int timeoutMs,
+                                             string[] preferred, string[] avoid) {
+        var connection = new Connection(timeoutMs);
+        connection.Preferred = preferred;
+        connection.Avoid = avoid;
+        return Run(connection, proxyScheme, proxyHost, proxyPort, host, path);
+    }
+    // Diagnostics: the same check through every address of the proxy name separately (at most 16), so that the person
+    // sees which addresses work. The certificate is checked for the proxy name for each of them.
+    public static RuTrackerRouteResult[] CheckEach(string proxyScheme, string proxyHost, int proxyPort, string host, string path, int timeoutMs) {
+        var probe = new Connection(timeoutMs);
+        IPAddress[] addresses;
+        try { addresses = probe.ResolveName(proxyHost); } catch (RuTrackerRouteFailure) { addresses = new IPAddress[0]; } finally { probe.Dispose(); }
+        if (addresses.Length == 0) return new[] { Check(proxyScheme, proxyHost, proxyPort, host, path, timeoutMs) };
+        var results = new List<RuTrackerRouteResult>();
+        for (int i = 0; i < addresses.Length && i < Connection.MaxProxyAddresses; i++) {
+            var connection = new Connection(timeoutMs);
+            connection.Only = addresses[i];
+            results.Add(Run(connection, proxyScheme, proxyHost, proxyPort, host, path));
+        }
+        return results.ToArray();
+    }
+    static RuTrackerRouteResult Run(Connection connection, string proxyScheme, string proxyHost, int proxyPort, string host, string path) {
         var result = new RuTrackerRouteResult();
         var watch = Stopwatch.StartNew();
-        var connection = new Connection(timeoutMs);
         try {
             Stream stream = connection.Open(proxyScheme, proxyHost, proxyPort, host, 443, "TorrentControl-route-check");
             connection.Stage = "Http";
@@ -98,6 +137,10 @@ public static class RuTrackerRoute {
             result.Attempts = connection.Attempts;
             result.Endpoint = connection.Endpoint;
             result.TlsVersion = connection.TlsVersion;
+            result.AddressSource = connection.AddressSource;
+            result.DnsAddresses = connection.DnsAddresses;
+            result.AttemptAddresses = connection.AttemptAddresses.ToArray();
+            result.AttemptCodes = connection.AttemptCodes.ToArray();
             result.ElapsedMs = watch.ElapsedMilliseconds;
         }
         return result;
@@ -105,30 +148,39 @@ public static class RuTrackerRoute {
 
     // One HTTPS request to url through the route. Cookies come from and go to the container (RFC rules of
     // CookieContainer: a cookie of rutracker.org is never sent to another host).
+    // The request (and a POST body) is sent once, on the first address whose route is fully established; after that no
+    // other address is tried, whatever happens to the answer.
     public static RuTrackerHttpResult Send(string proxyScheme, string proxyHost, int proxyPort, string method, string url, CookieContainer cookies,
                                            string contentType, byte[] body, string userAgent, int timeoutMs, int maxBody) {
+        return Send(proxyScheme, proxyHost, proxyPort, method, url, cookies, contentType, body, userAgent, timeoutMs, maxBody, null, null);
+    }
+    public static RuTrackerHttpResult Send(string proxyScheme, string proxyHost, int proxyPort, string method, string url, CookieContainer cookies,
+                                           string contentType, byte[] body, string userAgent, int timeoutMs, int maxBody, string[] preferred, string[] avoid) {
         var result = new RuTrackerHttpResult();
         Uri uri;
         if (!Uri.TryCreate(url, UriKind.Absolute, out uri) || uri.Scheme != "https" || uri.UserInfo.Length > 0) { result.Error = "UnsupportedUrl"; return result; }
         var connection = new Connection(timeoutMs);
+        connection.Preferred = preferred;
+        connection.Avoid = avoid;
         try {
             Stream stream = connection.Open(proxyScheme, proxyHost, proxyPort, uri.Host, uri.Port, userAgent);
             connection.Stage = "Http";
-            RuTrackerHttpResult answer = Exchange(stream, method, uri, cookies, contentType, body, userAgent, maxBody);
-            answer.Stage = connection.Stage;
-            answer.ProxyStatus = connection.ProxyStatus;
-            answer.TlsVersion = connection.TlsVersion;
-            return answer;
+            result = Exchange(stream, method, uri, cookies, contentType, body, userAgent, maxBody);
         } catch (Exception e) {
             result.Error = connection.Classify(e);
-            result.Stage = connection.Stage;
-            result.ProxyStatus = connection.ProxyStatus;
             result.TlsErrors = connection.TlsErrors;
-            result.TlsVersion = connection.TlsVersion;
-            return result;
         } finally {
             connection.Dispose();
+            result.Stage = connection.Stage;
+            result.ProxyStatus = connection.ProxyStatus;
+            result.TlsVersion = connection.TlsVersion;
+            result.Endpoint = connection.Endpoint;
+            result.AddressSource = connection.AddressSource;
+            result.DnsAddresses = connection.DnsAddresses;
+            result.AttemptAddresses = connection.AttemptAddresses.ToArray();
+            result.AttemptCodes = connection.AttemptCodes.ToArray();
         }
+        return result;
     }
 
     // HTTP/1.1 exchange over an already established stream (always the validated TLS stream in production; tests use
@@ -186,12 +238,13 @@ public static class RuTrackerRoute {
     }
 
     sealed class Connection : IDisposable {
-        const int MaxProxyAttempts = 3;
+        public const int MaxProxyAddresses = 16;
         // A TCP connection to a working server takes well under a second; an address that does not answer must not
         // use up the whole request timeout before the next address is tried.
         const int MaxConnectMs = 10000;
-        // Last proxy address that gave a full route, per proxy name and port (this process only, nothing is stored).
-        static readonly Dictionary<string, string> LastGood = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+        // Handshakes through one proxy address (TCP, TLS to the proxy, CONNECT, TLS with the site): every read waits at
+        // most this long. Working addresses of the official proxy needed 1.3-4.5 s for the whole check on the PC.
+        const int MaxAttemptMs = 7000;
         readonly int timeoutMs;
         readonly Stopwatch watch = Stopwatch.StartNew();
         readonly List<IDisposable> owned = new List<IDisposable>();
@@ -199,7 +252,14 @@ public static class RuTrackerRoute {
         readonly List<TcpClient> sockets = new List<TcpClient>();
         readonly Timer guard;
         volatile bool expired;
-        bool proxyCertificateRejected;
+        NetworkStream current;
+        public string[] Preferred;
+        public string[] Avoid;
+        public IPAddress Only;
+        public string AddressSource = "";
+        public string[] DnsAddresses = new string[0];
+        public readonly List<string> AttemptAddresses = new List<string>();
+        public readonly List<string> AttemptCodes = new List<string>();
         public string Stage = "";
         public int ProxyStatus;
         public string TlsErrors = "";
@@ -236,42 +296,85 @@ public static class RuTrackerRoute {
                     if (client != null) break;
                 }
                 if (client == null) throw new RuTrackerRouteFailure(failure == "Timeout" ? "Timeout" : "ConnectFailed");
-                return Secure(Prepare(client), host);
+                return Secure(Prepare(client, timeoutMs), host);
             }
             if (proxyScheme != "http" && proxyScheme != "https") throw new RuTrackerRouteFailure("ProxyUnsupported");
             Stage = "ProxyConnect";
-            string key = proxyHost + ":" + proxyPort;
-            IPAddress[] proxies = Prefer(Resolve(proxyHost), key);
-            Addresses = proxies.Length;
-            if (proxies.Length == 0) throw new RuTrackerRouteFailure("ProxyUnreachable");
-            for (int i = 0; ; i++) {
+            List<IPAddress> order = Order(proxyHost);
+            if (order.Count == 0) throw new RuTrackerRouteFailure("ProxyUnreachable");
+            int attemptMs = Math.Min(timeoutMs, MaxAttemptMs);
+            long totalMs = 3L * timeoutMs;   // the hard limit of the guard
+            string lastCode = "ProxyUnreachable";
+            for (int i = 0; i < order.Count; i++) {
                 if (expired) throw new RuTrackerRouteFailure("Timeout");
+                // Another address only if its handshakes can end with one timeout left for the request and its answer.
+                if (i > 0 && watch.ElapsedMilliseconds + attemptMs > totalMs - timeoutMs) break;
                 Attempts = i + 1;
+                AttemptAddresses.Add(order[i].ToString());
                 try {
-                    Stream stream = ThroughProxy(proxyScheme == "https", proxyHost, proxies[i], proxyPort, host, port, agent);
-                    lock (LastGood) { LastGood[key] = proxies[i].ToString(); }
+                    Stream stream = ThroughProxy(proxyScheme == "https", proxyHost, order[i], proxyPort, host, port, agent, attemptMs);
+                    AttemptCodes.Add("Ok");
+                    SetTimeouts(timeoutMs);   // the request and its answer get the normal timeout
                     return stream;
                 } catch (Exception e) {
                     string code = Classify(e);
-                    bool last = expired || i + 1 >= proxies.Length || i + 1 >= MaxProxyAttempts || watch.ElapsedMilliseconds > 2L * timeoutMs;
-                    if (last || !MayTryAnotherAddress(code)) throw new RuTrackerRouteFailure(code);
+                    AttemptCodes.Add(code);
+                    if (!MayTryAnotherAddress(code)) throw new RuTrackerRouteFailure(code);
+                    lastCode = code;
                     Release();
                 }
             }
+            throw new RuTrackerRouteFailure(lastCode);
+        }
+
+        public IPAddress[] ResolveName(string name) { return Resolve(name); }
+
+        // Addresses to try: DNS answer ordered by the caller's experience; remembered addresses only without DNS.
+        List<IPAddress> Order(string name) {
+            var result = new List<IPAddress>();
+            if (Only != null) { AddressSource = "fixed"; result.Add(Only); return result; }
+            IPAddress[] dns;
+            try { dns = Resolve(name); } catch (RuTrackerRouteFailure) { dns = new IPAddress[0]; }
+            if (expired) throw new RuTrackerRouteFailure("Timeout");
+            Addresses = dns.Length;
+            var names = new List<string>();
+            foreach (IPAddress address in dns) names.Add(address.ToString());
+            DnsAddresses = names.ToArray();
+            string[] preferred = Preferred ?? new string[0];
+            string[] avoid = Avoid ?? new string[0];
+            if (dns.Length > 0) {
+                AddressSource = "dns";
+                foreach (string text in preferred) AddFrom(dns, text, result);
+                foreach (IPAddress address in dns) if (!result.Contains(address) && Array.IndexOf(avoid, address.ToString()) < 0) result.Add(address);
+                foreach (string text in avoid) AddFrom(dns, text, result);
+                foreach (IPAddress address in dns) if (!result.Contains(address)) result.Add(address);
+            } else {
+                AddressSource = "cache";
+                foreach (string text in preferred) AddParsed(text, result);
+                foreach (string text in avoid) AddParsed(text, result);
+            }
+            if (result.Count > MaxProxyAddresses) result.RemoveRange(MaxProxyAddresses, result.Count - MaxProxyAddresses);
+            return result;
+        }
+        static void AddFrom(IPAddress[] dns, string text, List<IPAddress> result) {
+            foreach (IPAddress address in dns) if (address.ToString() == text && !result.Contains(address)) result.Add(address);
+        }
+        static void AddParsed(string text, List<IPAddress> result) {
+            IPAddress address;
+            if (IPAddress.TryParse(text, out address) && !result.Contains(address)) result.Add(address);
         }
 
         // One proxy address: nothing of the request is sent here, only CONNECT host:port and the TLS handshakes.
-        Stream ThroughProxy(bool proxyTls, string proxyHost, IPAddress address, int proxyPort, string host, int port, string agent) {
+        Stream ThroughProxy(bool proxyTls, string proxyHost, IPAddress address, int proxyPort, string host, int port, string agent, int attemptMs) {
             Stage = "ProxyConnect";
             ProxyStatus = 0;
             TlsErrors = "";
             TlsVersion = "";
-            proxyCertificateRejected = false;
             Endpoint = Format(address, proxyPort);
             TcpClient client;
-            string failure = TryConnect(address, proxyPort, out client);
+            string failure = TryConnect(address, proxyPort, out client, attemptMs);
             if (client == null) throw new RuTrackerRouteFailure(failure == "Timeout" ? "Timeout" : "ProxyUnreachable");
-            Stream stream = Prepare(client);
+            Stream stream = Prepare(client, attemptMs);
             if (proxyTls) {
                 Stage = "ProxyTls";
                 stream = AuthenticateProxy(stream, proxyHost);
@@ -284,17 +387,17 @@ public static class RuTrackerRoute {
             return Secure(stream, host);
         }
 
-        // Another address of the same proxy is tried only for failures of that address; never after a certificate was
-        // rejected (proxy or site) or the proxy asked for a password.
-        bool MayTryAnotherAddress(string code) {
+        // Another address of the same proxy is tried only for network failures of that address (no connection, no or a
+        // broken answer, a refused tunnel, a TLS handshake that broke off); never after a certificate was rejected
+        // (ProxyCertificateInvalid, TlsCertificateInvalid) or the proxy asked for a password.
+        static bool MayTryAnotherAddress(string code) {
             switch (code) {
                 case "ProxyUnreachable":
                 case "Timeout":
                 case "ProxyRefused":
+                case "ProxyTlsFailed":
                 case "TlsFailed":
                     return true;
-                case "ProxyTlsFailed":
-                    return !proxyCertificateRejected;
                 default:
                     return false;
             }
@@ -322,8 +425,9 @@ public static class RuTrackerRoute {
             try {
                 ssl.AuthenticateAsClient(name, null, SslProtocols.Tls12, false);
             } catch (AuthenticationException) {
-                proxyCertificateRejected = seen != SslPolicyErrors.None;
-                TlsErrors = proxyCertificateRejected ? seen.ToString() : "";
+                // A certificate the callback refused is a certificate failure: the search for another address stops.
+                // Anything else in the handshake (closed, broken, no answer) is a network failure of this address.
+                if (seen != SslPolicyErrors.None) { TlsErrors = seen.ToString(); throw new RuTrackerRouteFailure("ProxyCertificateInvalid"); }
                 throw new RuTrackerRouteFailure("ProxyTlsFailed");
             }
             return ssl;
@@ -348,31 +452,18 @@ public static class RuTrackerRoute {
             return ordered.ToArray();
         }
 
-        static IPAddress[] Prefer(IPAddress[] addresses, string key) {
-            string good;
-            lock (LastGood) { if (!LastGood.TryGetValue(key, out good)) return addresses; }
-            var list = new List<IPAddress>(addresses);
-            for (int i = 1; i < list.Count; i++) {
-                if (list[i].ToString() != good) continue;
-                IPAddress preferred = list[i];
-                list.RemoveAt(i);
-                list.Insert(0, preferred);
-                break;
-            }
-            return list.ToArray();
-        }
-
         static string Format(IPAddress address, int port) {
             return address.AddressFamily == AddressFamily.InterNetworkV6 ? "[" + address + "]:" + port : address + ":" + port;
         }
 
-        string TryConnect(IPAddress address, int port, out TcpClient client) {
+        string TryConnect(IPAddress address, int port, out TcpClient client) { return TryConnect(address, port, out client, MaxConnectMs); }
+        string TryConnect(IPAddress address, int port, out TcpClient client, int limitMs) {
             client = null;
             TcpClient candidate = null;
             try {
                 candidate = new TcpClient(address.AddressFamily);   // throws where IPv6 is off: that address is skipped
                 IAsyncResult connect = candidate.BeginConnect(address, port, null, null);
-                if (!connect.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, MaxConnectMs))) { candidate.Close(); return "Timeout"; }
+                if (!connect.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, Math.Min(limitMs, MaxConnectMs)))) { candidate.Close(); return "Timeout"; }
                 candidate.EndConnect(connect);
                 lock (gate) {
                     if (expired) { candidate.Close(); return "Timeout"; }
@@ -387,13 +478,20 @@ public static class RuTrackerRoute {
             }
         }
 
-        Stream Prepare(TcpClient client) {
-            client.ReceiveTimeout = timeoutMs;
-            client.SendTimeout = timeoutMs;
-            NetworkStream stream = client.GetStream();
-            stream.ReadTimeout = timeoutMs;
-            stream.WriteTimeout = timeoutMs;
-            return stream;
+        Stream Prepare(TcpClient client, int readMs) {
+            client.ReceiveTimeout = readMs;
+            client.SendTimeout = readMs;
+            current = client.GetStream();
+            current.ReadTimeout = readMs;
+            current.WriteTimeout = readMs;
+            return current;
+        }
+
+        // TLS streams on top read through this socket: a new timeout applies to all following reads and writes.
+        void SetTimeouts(int readMs) {
+            if (current == null) return;
+            current.ReadTimeout = readMs;
+            current.WriteTimeout = readMs;
         }
 
         public string Classify(Exception e) {
@@ -405,7 +503,7 @@ public static class RuTrackerRoute {
                 case "Dns": return "DnsFailed";
                 case "Connect": return "ConnectFailed";
                 case "ProxyConnect": return "ProxyUnreachable";
-                case "ProxyTls": return "ProxyTlsFailed";
+                case "ProxyTls": return "ProxyTlsFailed";   // network failure during the handshake (no certificate refused)
                 case "ProxyTunnel": return "ProxyRefused";
                 case "Tls": return "TlsFailed";
                 default: return "HttpUnexpected";

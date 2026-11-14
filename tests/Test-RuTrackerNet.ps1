@@ -225,7 +225,21 @@ try {
     function Read-RuTrackerCredential([string]$Directory) { $script:credentialRead = $true; return $null }
     function Get-ListeningSockets { return ,$sockets }
     # The official RuTracker proxy is never contacted by the tests: its answer is simulated.
-    $script:officialResult = [pscustomobject]@{ Ok = $false; Code = 'ProxyTlsFailed'; Stage = 'ProxyTls'; ProxyStatus = 0; HttpStatus = 0; TlsErrors = 'RemoteCertificateChainErrors'; Addresses = 0; ElapsedMs = 900 }
+    $script:officialResult = [pscustomobject]@{ Ok = $false; Code = 'ProxyCertificateInvalid'; Stage = 'ProxyTls'; ProxyStatus = 0; HttpStatus = 0; TlsErrors = 'RemoteCertificateChainErrors'; Addresses = 0; ElapsedMs = 900 }
+    # Every address separately (CheckEach) is simulated as well; only proxy names are probed.
+    $script:officialProbe = @()
+    $script:probed = New-Object Collections.ArrayList
+    function Invoke-RuTrackerAddressProbe([string]$Proxy, [int]$TimeoutMs) {
+        [void]$script:probed.Add($Proxy)
+        if ($Proxy -eq 'https://ps1.blockme.site:443') { return $script:officialProbe }
+        return @()
+    }
+    function New-Probe([string]$Address, [string]$Code, [string]$Stage = 'Http', [string]$Errors = '', [string[]]$Pool = @()) {
+        $ok = $Code -eq 'Ok'
+        return [pscustomobject]@{ Ok = $ok; Code = $Code; Stage = $Stage; ProxyStatus = 200; HttpStatus = $(if ($ok) { 200 } else { 0 }); TlsErrors = $Errors; Addresses = $Pool.Count
+            Attempts = 1; Endpoint = $Address + ':443'; TlsVersion = $(if ($ok) { 'TLS 1.3' } else { '' }); AddressSource = 'fixed'; DnsAddresses = $Pool
+            AttemptAddresses = @($Address); AttemptCodes = @($Code); ElapsedMs = 1300 }
+    }
     function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
         [void]$script:checks.Add($Proxy)
         if (!$Proxy) { return [RuTrackerRoute]::Check('', 0, 'rutracker.invalid', '/forum/index.php', 5000) }   # direct: DNS failure
@@ -246,7 +260,10 @@ try {
     Assert ($text -match 'DNS rutracker\.org на этом компьютере: (имя rutracker\.org не разрешается|нет ответа)' -and $text -match 'http://127\.0\.0\.1:12334 \(процесс Hiddify\): РАБОТАЕТ') "report: $text"
     Assert ($text -match ('http://127\.0\.0\.1:' + $hiddify.Port + ' \(процесс HiddifyCli\): прокси не открыл туннель к rutracker\.org:443 \(ответ 403\)')) "refused proxy not explained: $text"
     Assert ($text -match 'ИТОГ: рабочий маршрут через http://127\.0\.0\.1:12334') 'verdict missing'
-    Assert ($script:checks -contains 'https://ps1.blockme.site:443' -and $text -match 'https://ps1\.blockme\.site:443 \(официальный прокси RuTracker, тот же, что у расширения Firefox\): защищённое соединение с самим прокси не установлено \(RemoteCertificateChainErrors\)') "official proxy not checked or not explained: $text"
+    Assert ($script:checks -contains 'https://ps1.blockme.site:443' -and $text -match 'https://ps1\.blockme\.site:443 \(официальный прокси RuTracker, тот же, что у расширения Firefox\): сертификат прокси не прошёл проверку \(RemoteCertificateChainErrors\): перебор адресов остановлен') "official proxy not checked or not explained: $text"
+    Assert ($script:probed -contains 'https://ps1.blockme.site:443') 'every address of a proxy name not probed'
+    $network = [pscustomobject]@{ Ok = $false; Code = 'ProxyTlsFailed'; Stage = 'ProxyTls'; ProxyStatus = 0; HttpStatus = 0; TlsErrors = ''; Addresses = 9; Attempts = 3; Endpoint = '5.252.179.138:443'; ElapsedMs = 9000 }
+    Assert ((Format-RouteResult $network 10) -match '^защищённое соединение с самим прокси оборвалось или не ответило \(сетевая ошибка TLS; сертификат не отклонялся\); адрес прокси 5\.252\.179\.138:443, попыток 3 из 9') 'network failure of the proxy TLS reported as a certificate problem'
     Assert ((Get-ProxyText $webui) -eq '' -and $script:checks -notcontains ('http://127.0.0.1:' + $webui.Port)) 'the uTorrent WebUI port was probed'
     Assert (!$script:credentialRead) 'diagnostics read the RuTracker credential'
     foreach ($s in $secrets + @('FAKE')) { Assert ($text -notmatch [regex]::Escape($s)) "report contains '$s'" }
@@ -265,6 +282,31 @@ try {
     $script:checks.Clear()
     $null = Invoke-RuTrackerDiagnostics $official '' 3 -NoOfficialProxy
     Assert ($script:checks -contains 'https://ps1.blockme.site:443') 'a configured official proxy was not checked'
+    $script:checks.Clear()
+    # The PC case: the check through the proxy name failed (old limit of 3 addresses), but 4 of its 9 addresses work.
+    # The probe of every address shows them, the verdict is the official proxy, and -Save keeps their order.
+    $pool = [string[]]@('82.21.4.208', '135.181.99.133', '194.59.30.2', '5.252.179.138', '38.133.142.207', '193.29.12.104', '146.103.24.209', '151.242.242.58', '45.144.30.1')
+    $script:officialResult = $network
+    $script:officialProbe = @(
+        (New-Probe '82.21.4.208' 'Timeout' 'ProxyTls' '' $pool), (New-Probe '135.181.99.133' 'ProxyTlsFailed' 'ProxyTls' '' $pool),
+        (New-Probe '194.59.30.2' 'Timeout' 'ProxyTls' '' $pool), (New-Probe '5.252.179.138' 'ProxyTlsFailed' 'ProxyTls' '' $pool),
+        (New-Probe '38.133.142.207' 'Ok' 'Http' '' $pool), (New-Probe '193.29.12.104' 'Ok' 'Http' '' $pool), (New-Probe '146.103.24.209' 'Ok' 'Http' '' $pool),
+        (New-Probe '151.242.242.58' 'Ok' 'Http' '' $pool), (New-Probe '45.144.30.1' 'ProxyUnreachable' 'ProxyConnect' '' $pool))
+    $pc = Join-Path $temp 'pc'
+    $null = Microsoft.PowerShell.Management\New-Item -Path $pc -ItemType Directory
+    $report = Invoke-RuTrackerDiagnostics $pc '' 10
+    $text = $report.lines -join "`n"
+    Assert ($report.working -eq 'https://ps1.blockme.site:443' -and @($report.probe).Count -eq 9) "working addresses of the proxy name ignored: $($report.working)"
+    Assert ($text -match 'Рабочих адресов: 4 из 9' -and $text -match '193\.29\.12\.104:443: РАБОТАЕТ \(TLS 1\.3, HTTP 200\)' -and $text -match '82\.21\.4\.208:443: нет ответа \(этап: TLS с прокси\)' -and
+        $text -match '135\.181\.99\.133:443: TLS с прокси оборвался или не ответил \(сетевая ошибка\)' -and $text -match '45\.144\.30\.1:443: нет TCP-соединения') "per-address report: $text"
+    Assert (!(Test-Path -LiteralPath (Join-Path $pc 'rutracker-proxy-addresses.json'))) 'address order saved without -Save'
+    Save-RuTrackerAddressProbe $pc $report.working $report.probe
+    Assert (Test-Path -LiteralPath (Join-Path $pc 'rutracker-proxy-addresses.json')) 'address order not saved'
+    $script:RuTrackerAddressMemory = @{}
+    $hints = Get-RuTrackerAddressHints 'https://ps1.blockme.site:443'
+    Assert (((@($hints.preferred) | Sort-Object) -join ',') -eq '146.103.24.209,151.242.242.58,193.29.12.104,38.133.142.207' -and @($hints.avoid).Count -eq 5) "saved order: $(@($hints.preferred) -join ',') / $(@($hints.avoid) -join ',')"
+    $script:RuTrackerAddressFile = ''; $script:RuTrackerAddressMemory = @{}
+    $script:officialProbe = @()
     $script:checks.Clear()
     # Nothing works: Hiddify guidance, no external proxy suggested, nothing saved.
     function Get-ListeningSockets { return ,@() }

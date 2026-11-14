@@ -29,6 +29,7 @@ rutracker-proxy.txt
 rutracker-connection.txt
 rutracker-session.xml
 rutracker-state.json
+rutracker-proxy-addresses.json
 tracker-migration.json
 tracker-migration.html
 tracker-migration.csv

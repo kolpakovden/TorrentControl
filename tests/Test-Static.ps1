@@ -71,7 +71,10 @@ foreach ($file in $production) {
         '(?i)CheckCertificateRevocationList', '(?i)AllowAutoRedirect\s*=\s*\$true', '(?i)(Start|Stop)-Process[^\r\n]*(hiddify|sing-?box)', 'http://rutracker')) {
         Assert ($text -notmatch $pattern) "$($file.Name) changes network settings or weakens TLS: '$pattern'"
     }
-    if ($file.Name -ne 'RuTrackerRoute.cs') {
+    if ($file.Name -eq 'Test-RuTrackerTls13.ps1') {
+        # The PC test only records the errors Windows found, to tell a refused proxy certificate from a network error.
+        Assert (([regex]::Matches($text, 'RemoteCertificateValidationCallback')).Count -eq 1 -and $text -match [regex]::Escape('return ($errors -eq [Net.Security.SslPolicyErrors]::None)')) "$($file.Name) relaxes certificate validation"
+    } elseif ($file.Name -ne 'RuTrackerRoute.cs') {
         Assert ($text -notmatch 'RemoteCertificateValidationCallback|SslPolicyErrors') "$($file.Name) handles certificate validation"
     }
 }
@@ -81,13 +84,15 @@ Assert ($route -match [regex]::Escape('"CONNECT " + host + ":" + port + " HTTP/1
 # TLS with the site only through RuTrackerTls13 (TLS 1.3 on Windows 10; chain + host name); Schannel only for the proxy.
 Assert (([regex]::Matches($route, 'AuthenticateAsClient\(')).Count -eq 1 -and ([regex]::Matches($route, [regex]::Escape('RuTrackerTls13.Connect('))).Count -eq 1 -and
     $route -match [regex]::Escape('session = RuTrackerTls13.Connect(inner, host, host);')) 'TLS with the site must go through RuTrackerTls13 with the host as the expected name'
-Assert (([regex]::Matches($route, 'return Secure\(')).Count -eq 2 -and $route -match [regex]::Escape('return Secure(Prepare(client), host);') -and $route -match [regex]::Escape('return Secure(stream, host);')) 'every route (direct and proxy) must end in TLS with the site'
+Assert (([regex]::Matches($route, 'return Secure\(')).Count -eq 2 -and $route -match [regex]::Escape('return Secure(Prepare(client, timeoutMs), host);') -and $route -match [regex]::Escape('return Secure(stream, host);')) 'every route (direct and proxy) must end in TLS with the site'
 # Another proxy address only before the request and never after a refused certificate or a proxy password request.
-$retry = [regex]::Match($route, '(?s)bool MayTryAnotherAddress\(string code\) \{.*?\n        \}').Value
-Assert ($retry -and $retry -notmatch 'TlsCertificateInvalid|ProxyAuthRequired|Http' -and $retry -match [regex]::Escape('return !proxyCertificateRejected;')) 'proxy failover must stop at certificate and password failures'
+$retry = [regex]::Match($route, '(?s)static bool MayTryAnotherAddress\(string code\) \{.*?\n        \}').Value
+Assert ($retry -and $retry -notmatch 'CertificateInvalid|ProxyAuthRequired|Http' -and $retry -match '"ProxyTlsFailed":') 'proxy failover must stop at certificate and password failures'
+# A certificate the callback refused is its own code (ProxyCertificateInvalid), never a network failure of the address.
+Assert ($route -match [regex]::Escape('if (seen != SslPolicyErrors.None) { TlsErrors = seen.ToString(); throw new RuTrackerRouteFailure("ProxyCertificateInvalid"); }')) 'a refused proxy certificate must stop the search for another address'
 foreach ($file in $production) { Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'TestAddresses' -or $file.Name -eq 'RuTrackerRoute.cs') "$($file.Name) sets test proxy addresses" }
 Assert ($route -match [regex]::Escape('if (name.EndsWith(".test", StringComparison.OrdinalIgnoreCase)) {')) 'test addresses must stay limited to the reserved .test domain'
-Assert ($route -match [regex]::Escape('WaitOne(Math.Min(timeoutMs, MaxConnectMs))') -and $ru -match '(?s)function Get-PersonalTorrent\(.*?\$script:RuTrackerDeadline = \[DateTime\]::UtcNow\.AddSeconds\(\$script:RuTrackerBudgetSeconds\).*?finally \{ \$script:RuTrackerDeadline = \$null \}') 'RuTracker requests must stay inside the 5-minute limit of the scheduled task'
+Assert ($route -match [regex]::Escape('WaitOne(Math.Min(timeoutMs, Math.Min(limitMs, MaxConnectMs)))') -and $ru -match '(?s)function Get-PersonalTorrent\(.*?\$script:RuTrackerDeadline = \[DateTime\]::UtcNow\.AddSeconds\(\$script:RuTrackerBudgetSeconds\).*?finally \{ \$script:RuTrackerDeadline = \$null \}') 'RuTracker requests must stay inside the 5-minute limit of the scheduled task'
 # One monitor run stays inside the 5-minute limit of the scheduled task (Monitor.ps1 -Setup registers it).
 $monitor = [IO.File]::ReadAllText((Join-Path $repo 'Monitor.ps1'))
 $autoText = [IO.File]::ReadAllText((Join-Path $repo 'AutoLoad.ps1'))
@@ -97,7 +102,11 @@ Assert ($autoText -match '(?s)Test-AutoTimeLeft \$script:AutoItemSeconds.*?Test-
 Assert ($ru -match [regex]::Escape('if ($null -ne $script:AutoRunDeadline -and $script:AutoRunDeadline -lt $script:RuTrackerDeadline) { $script:RuTrackerDeadline = $script:AutoRunDeadline }')) 'RuTracker must respect the run limit'
 Assert ($route -match [regex]::Escape('guard = new Timer(Expire, null, 3L * timeoutMs, System.Threading.Timeout.Infinite);') -and $route -match [regex]::Escape('if (expired) return "Timeout";')) 'a request must end after 3 timeouts at the latest'
 Assert ($ru -match [regex]::Escape('$script:RuTrackerBudgetSeconds = 120') -and ([regex]::Matches($ru, 'Get-RuTrackerTimeout ')).Count -ge 2) 'time budget not applied to every request'
-Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('const int MaxProxyAttempts = 3;')) 'failover attempt must end before the request'
+Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('public const int MaxProxyAddresses = 16;') -and
+    $route -match [regex]::Escape('if (i > 0 && watch.ElapsedMilliseconds + attemptMs > totalMs - timeoutMs) break;')) 'failover attempt must end before the request, bounded by the time of the request'
+# The order of proxy addresses is learned by RuTracker.ps1 (rutracker-proxy-addresses.json), not fixed in code.
+Assert ($ru -match [regex]::Escape("addresses = Join-Path `$Directory 'rutracker-proxy-addresses.json'") -and $ru -match [regex]::Escape('$hints.preferred, $hints.avoid)') -and $route -notmatch 'LastGood') 'proxy address order must come from the learned state'
+Assert ([IO.File]::ReadAllText((Join-Path $repo '.gitignore')) -match '(?m)^rutracker-proxy-addresses\.json\s*$') 'rutracker-proxy-addresses.json is not in .gitignore'
 Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect') 'RuTrackerRoute.cs is the only transport and never follows redirects'
 Assert (([regex]::Matches($ru, [regex]::Escape('[RuTrackerRoute]::Send('))).Count -eq 1 -and $ru -notmatch 'Invoke-WebRequest|WebRequest\]::Create|HttpClient|Net\.WebProxy') 'RuTracker requests must go through RuTrackerRoute.cs only'
 Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
@@ -119,7 +128,7 @@ foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {
     if ($file.Name -eq 'RuTrackerTls13.ps1') { continue }
     Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'Add-Type[^\r\n]*RuTracker(Route|Tls13)\.cs') "$($file.Name) loads the transport on its own"
 }
-Assert ($ru -match [regex]::Escape('. "$PSScriptRoot\RuTrackerTls13.ps1"') -and ([regex]::Matches($ru, 'Initialize-RuTrackerNet\r?\n')).Count -eq 2) 'RuTracker.ps1 must use the shared loader'
+Assert ($ru -match [regex]::Escape('. "$PSScriptRoot\RuTrackerTls13.ps1"') -and ([regex]::Matches($ru, 'Initialize-RuTrackerNet\r?\n')).Count -eq 3) 'RuTracker.ps1 must use the shared loader'
 Assert ($loader -match [regex]::Escape('if ($hash -ne $entry.sha256) { throw ''TlsLibraryInvalid'' }') -and $loader -match [regex]::Escape('[Reflection.Assembly]::Load($bytes)') -and $loader -notmatch 'LoadFrom|LoadFile|UnsafeLoadFrom|Unblock-File') 'the TLS library must be loaded only from SHA-256-verified bytes'
 $libFiles = @(Get-ChildItem -LiteralPath (Join-Path $repo 'lib') -Recurse -File | ForEach-Object { $_.FullName.Substring($repo.Length + 1).Replace('\', '/') } | Sort-Object)
 Assert (($libFiles -join ',') -eq 'lib/bouncycastle/2.7.0/LICENSE.md,lib/bouncycastle/2.7.0/net461/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/net6.0/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/SOURCE.txt') "unexpected files in lib: $($libFiles -join ', ')"

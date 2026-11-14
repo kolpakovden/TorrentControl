@@ -130,6 +130,9 @@ sealed class TestTlsServer : DefaultTlsServer {
 //   close        accepts the connection and closes it at once
 //   refuse-403   answers CONNECT with 403        auth-407   answers CONNECT with 407
 //   site-garbage CONNECT 200, then plain bytes instead of the TLS server of the site
+//   silent       accepts the connection and never answers (no TLS, no CONNECT answer)
+//   drop-after-request  everything works up to the request inside TLS, which is read and then left unanswered
+//                (the connection is closed): a request must never be sent again through another address
 // The site: GET /forum/index.php -> 200; POST /forum/login.php with login_password=<Password> -> 302 + bb_session
 // cookie (any other password -> the login page); GET /forum/dl.php?t=<n> with that cookie -> Torrent (no
 // Content-Length: the body ends with close_notify), without it -> the login page (text/html).
@@ -192,6 +195,7 @@ public sealed class FakeTlsProxy : IDisposable {
         network.ReadTimeout = 10000;
         network.WriteTimeout = 10000;
         if (behaviour == "close") return;
+        if (behaviour == "silent") { for (int i = 0; i < 300 && !stopping; i++) Thread.Sleep(50); return; }
         Stream stream = network;
         TlsServerProtocol outer = null;
         if (proxyLeaf != null) {
@@ -215,6 +219,7 @@ public sealed class FakeTlsProxy : IDisposable {
         var body = new StringBuilder();
         for (int i = 0; i < length; i++) { int b = tls.ReadByte(); if (b < 0) break; body.Append((char)b); }
         lock (SiteRequests) { SiteRequests.Add(request + body.ToString()); }
+        if (behaviour == "drop-after-request") return;   // the socket is closed by Run()
         byte[] answer = Respond(request, body.ToString());
         tls.Write(answer, 0, answer.Length);
         tls.Flush();

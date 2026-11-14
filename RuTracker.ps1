@@ -67,6 +67,7 @@ function Get-RuTrackerFiles([string]$Directory) {
         credential = Join-Path $Directory 'rutracker-credential.xml'
         session = Join-Path $Directory 'rutracker-session.xml'
         state = Join-Path $Directory 'rutracker-state.json'
+        addresses = Join-Path $Directory 'rutracker-proxy-addresses.json'
     }
 }
 function Get-PersonalTorrentDirectory {
@@ -226,7 +227,95 @@ function Get-SystemRuTrackerProxy {
 function Resolve-RuTrackerProxy([string]$Directory) {
     $proxy = Read-RuTrackerProxy $Directory
     if (!$proxy) { $proxy = Get-SystemRuTrackerProxy }
+    # The learned order of proxy addresses is kept next to the scripts of this installation (see below).
+    $script:RuTrackerAddressFile = (Get-RuTrackerFiles $Directory).addresses
     return $proxy
+}
+
+# --- Addresses of the proxy name ---------------------------------------------------------------------------------
+# ps1.blockme.site has 9 addresses, of which only some work at a time. RuTrackerRoute.cs asks DNS every time and tries
+# the addresses in this order: those that worked most recently (the last working one first), then the unknown ones in
+# DNS order, then those that failed within RuTrackerAddressAvoidHours. What was learned is kept in
+# rutracker-proxy-addresses.json next to the scripts (public proxy addresses and times only, no secrets), so the next
+# run of the scheduled task starts with the last working address. Saved atomically; a damaged or foreign file only
+# loses the order. Nothing is fixed for ever: a failure moves an address back, after AvoidHours a failed address is
+# unknown again, and addresses not seen in DNS for RuTrackerAddressKeepDays are forgotten. Remembered addresses are
+# used without DNS only when DNS gives nothing. The certificate is always checked for the proxy NAME.
+$script:RuTrackerAddressFile = ''          # set by Resolve-RuTrackerProxy; empty = this process only (diagnostics)
+$script:RuTrackerAddressMemory = @{}
+$script:RuTrackerAddressAvoidHours = 6
+$script:RuTrackerAddressKeepDays = 7
+function ConvertTo-RuTrackerTime([string]$Text) {
+    $value = [DateTimeOffset]::MinValue
+    if ($Text -and [DateTimeOffset]::TryParse($Text, [Globalization.CultureInfo]::InvariantCulture, [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$value)) { return $value }
+    return $null
+}
+function Get-RuTrackerAddressKey($Route) { return ([string]$Route.scheme + '://' + [string]$Route.host + ':' + [string]$Route.port) }
+function Read-RuTrackerAddressState([string]$Key) {
+    if ($script:RuTrackerAddressMemory.ContainsKey($Key)) { return $script:RuTrackerAddressMemory[$Key] }
+    $state = [pscustomobject]@{ proxy = $Key; addresses = New-Object Collections.ArrayList }
+    if ($script:RuTrackerAddressFile -and [IO.File]::Exists($script:RuTrackerAddressFile)) {
+        try {
+            $saved = Get-Content -LiteralPath $script:RuTrackerAddressFile -Raw -Encoding UTF8 | ConvertFrom-Json
+            if ($saved.version -eq 1 -and [string]$saved.proxy -eq $Key) {
+                foreach ($entry in @($saved.addresses | Select-Object -First 64)) {
+                    $ip = $null
+                    if (![Net.IPAddress]::TryParse([string]$entry.address, [ref]$ip)) { continue }
+                    [void]$state.addresses.Add([pscustomobject]@{ address = $ip.ToString(); lastOk = [string]$entry.lastOk; lastFail = [string]$entry.lastFail
+                        failCode = [string]$entry.failCode; seen = [string]$entry.seen })
+                }
+            }
+        } catch { $state.addresses.Clear() }   # damaged: start without an order
+    }
+    $script:RuTrackerAddressMemory[$Key] = $state
+    return $state
+}
+function Get-RuTrackerAddressHints([string]$Key) {
+    # preferred: addresses whose last result was success, the most recent first; avoid: failed within AvoidHours,
+    # the oldest failure first. Addresses not seen for KeepDays are not used at all.
+    $state = Read-RuTrackerAddressState $Key
+    $now = [DateTimeOffset]::UtcNow
+    $good = @(); $bad = @()
+    foreach ($entry in $state.addresses) {
+        $seen = ConvertTo-RuTrackerTime $entry.seen
+        if ($null -eq $seen -or ($now - $seen).TotalDays -gt $script:RuTrackerAddressKeepDays) { continue }
+        $ok = ConvertTo-RuTrackerTime $entry.lastOk
+        $fail = ConvertTo-RuTrackerTime $entry.lastFail
+        if ($null -ne $ok -and ($null -eq $fail -or $ok -gt $fail)) { $good += [pscustomobject]@{ address = $entry.address; at = $ok } }
+        elseif ($null -ne $fail -and ($now - $fail).TotalHours -lt $script:RuTrackerAddressAvoidHours) { $bad += [pscustomobject]@{ address = $entry.address; at = $fail } }
+    }
+    [pscustomobject]@{
+        preferred = [string[]]@($good | Sort-Object at -Descending | ForEach-Object { $_.address })
+        avoid = [string[]]@($bad | Sort-Object at | ForEach-Object { $_.address })
+    }
+}
+function Update-RuTrackerAddressState([string]$Key, $Result, [switch]$RouteCheck) {
+    # Records the attempts of one request: Ok = the route through that address was established. A route check that
+    # rutracker.org refused (403/429) counts as a failure of that exit address.
+    $state = Read-RuTrackerAddressState $Key
+    $now = [DateTimeOffset]::UtcNow.ToString('o')
+    $find = {
+        param([string]$Address)
+        foreach ($entry in $state.addresses) { if ($entry.address -eq $Address) { return $entry } }
+        $entry = [pscustomobject]@{ address = $Address; lastOk = ''; lastFail = ''; failCode = ''; seen = '' }
+        [void]$state.addresses.Add($entry)
+        return $entry
+    }
+    foreach ($address in @($Result.DnsAddresses)) { if ($address) { (& $find ([string]$address)).seen = $now } }
+    $tried = @($Result.AttemptAddresses); $codes = @($Result.AttemptCodes)
+    for ($i = 0; $i -lt $tried.Count -and $i -lt $codes.Count; $i++) {
+        $entry = & $find ([string]$tried[$i])
+        $entry.seen = $now
+        $code = [string]$codes[$i]
+        if ($code -eq 'Ok' -and $RouteCheck -and [string]$Result.Code -in @('HttpForbidden', 'HttpRateLimited')) { $code = [string]$Result.Code }
+        if ($code -eq 'Ok') { $entry.lastOk = $now; $entry.failCode = '' } else { $entry.lastFail = $now; $entry.failCode = $code }
+    }
+    $limit = [DateTimeOffset]::UtcNow.AddDays(-4 * $script:RuTrackerAddressKeepDays)
+    $kept = @($state.addresses | Where-Object { $t = ConvertTo-RuTrackerTime $_.seen; $null -ne $t -and $t -gt $limit } | Select-Object -First 64)
+    $state.addresses.Clear(); foreach ($entry in $kept) { [void]$state.addresses.Add($entry) }
+    if (!$script:RuTrackerAddressFile -or !$tried.Count) { return }
+    # The order is an optimisation: a failed save never stops a request.
+    try { Save-AutoJson ([ordered]@{ version = 1; proxy = $Key; updated = $now; addresses = @($state.addresses) }) $script:RuTrackerAddressFile } catch { }
 }
 function Initialize-RuTrackerNet {
     # The transport (RuTrackerRoute.cs, RuTrackerTls13.cs, lib\bouncycastle with its pinned SHA-256). A missing, replaced
@@ -250,7 +339,27 @@ function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutrack
     $TimeoutMs = Get-RuTrackerTimeout $TimeoutMs
     if ($TimeoutMs -le 0) { $spent = New-Object RuTrackerRouteResult; $spent.Code = 'Timeout'; return $spent }
     $route = Get-RuTrackerRouteParts $Proxy
-    return [RuTrackerRoute]::Check($route.scheme, $route.host, $route.port, $HostName, '/forum/index.php', $TimeoutMs)
+    if (!$route.scheme) { return [RuTrackerRoute]::Check('', '', 0, $HostName, '/forum/index.php', $TimeoutMs) }
+    $key = Get-RuTrackerAddressKey $route
+    $hints = Get-RuTrackerAddressHints $key
+    $result = [RuTrackerRoute]::Check($route.scheme, $route.host, $route.port, $HostName, '/forum/index.php', $TimeoutMs, $hints.preferred, $hints.avoid)
+    Update-RuTrackerAddressState $key $result -RouteCheck
+    return $result
+}
+function Invoke-RuTrackerAddressProbe([string]$Proxy, [int]$TimeoutMs) {
+    # Diagnostics: the anonymous check through every address of the proxy name separately (RuTrackerRoute.CheckEach).
+    Initialize-RuTrackerNet
+    $route = Get-RuTrackerRouteParts $Proxy
+    if (!$route.scheme -or $route.host -match '^[0-9.]+$|:') { return @() }
+    return @([RuTrackerRoute]::CheckEach($route.scheme, $route.host, $route.port, 'rutracker.org', '/forum/index.php', $TimeoutMs))
+}
+function Save-RuTrackerAddressProbe([string]$Directory, [string]$Proxy, $Results) {
+    # 15-RuTracker-connection.cmd -Save: what the probe of every address found becomes the starting order.
+    $route = Get-RuTrackerRouteParts $Proxy
+    $script:RuTrackerAddressFile = (Get-RuTrackerFiles $Directory).addresses
+    $key = Get-RuTrackerAddressKey $route
+    $script:RuTrackerAddressMemory.Remove($key)
+    foreach ($result in @($Results)) { Update-RuTrackerAddressState $key $result -RouteCheck }
 }
 function Get-RuTrackerNetError($Exception) {
     # A fixed network code from the exception chain; the message (which may quote a URL) is never used.
@@ -283,7 +392,7 @@ function Get-RuTrackerFailureCode([string]$NetCode) {
     $viaProxy = [bool]$script:RuTrackerProxy
     if ($NetCode -in @('ProxyUnreachable', 'ProxyRefused', 'ProxyAuthRequired', 'ProxyTlsFailed', 'ProxyUnsupported')) { return 'RuTrackerProxyUnavailable' }
     if ($NetCode -in @('DnsFailed', 'ConnectFailed', 'Timeout', 'NetworkError')) { if ($viaProxy) { return 'RuTrackerProxyUnavailable' }; return 'RuTrackerUnavailable' }
-    if ($NetCode -in @('TlsFailed', 'TlsCertificateInvalid')) { return 'RuTrackerTlsFailed' }
+    if ($NetCode -in @('TlsFailed', 'TlsCertificateInvalid', 'ProxyCertificateInvalid')) { return 'RuTrackerTlsFailed' }
     if ($NetCode -in @('HttpForbidden', 'HttpRateLimited')) { return 'RuTrackerBlocked' }
     return 'RuTrackerUnavailable'
 }
@@ -325,12 +434,16 @@ function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$
     $route = Get-RuTrackerRouteParts $script:RuTrackerProxy
     $body = $null; $type = ''
     if ($Form) { $body = [Text.Encoding]::ASCII.GetBytes($Form); $type = 'application/x-www-form-urlencoded' }
+    $hints = [pscustomobject]@{ preferred = [string[]]@(); avoid = [string[]]@() }
+    if ($route.scheme) { $key = Get-RuTrackerAddressKey $route; $hints = Get-RuTrackerAddressHints $key }
     try {
+        # Sent once: RuTrackerRoute.cs tries other proxy addresses only before the request, never after it.
         $answer = [RuTrackerRoute]::Send($route.scheme, $route.host, $route.port, $Method.ToUpperInvariant(), $Url, $Session.Cookies, $type, $body,
-            $script:RuTrackerUserAgent, $timeout, 4000000)
+            $script:RuTrackerUserAgent, $timeout, 4000000, $hints.preferred, $hints.avoid)
     } catch {
         return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = (Get-RuTrackerNetError $_.Exception) }
     }
+    if ($route.scheme) { Update-RuTrackerAddressState $key $answer }
     if ($answer.Error) { return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = [string]$answer.Error } }
     return [pscustomobject]@{ status = [int]$answer.Status; contentType = [string]$answer.ContentType; bytes = [byte[]]$answer.Body; location = [string]$answer.Location; error = '' }
 }

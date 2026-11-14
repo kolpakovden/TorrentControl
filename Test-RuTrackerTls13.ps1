@@ -6,6 +6,10 @@
 #   Windows X509Chain against this computer's trusted roots, serverAuth usage and dates, plus the host name) ->
 #   anonymous "GET /forum/index.php" (no login, no cookie): only the status line is read.
 # Then a mandatory negative check on the real certificate: the same handshake expecting another name MUST be refused.
+# It is done through the first working address that answers again; if none does, the report says NOT CHECKED.
+# For the TLS to the proxy a refused certificate (its SslPolicyErrors) is told apart from a network failure.
+# Exit codes: 0 = at least one address works and the wrong name was refused; 2 = no address works; 3 = a wrong name was
+# ACCEPTED (validation broken); 4 = addresses work, but the negative check could not be done; 1 = the test stopped.
 # The report (addresses, versions, certificate names, codes - no secrets) goes to rutracker-tls13-test.txt here.
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\RuTrackerTls13.ps1"
@@ -23,8 +27,17 @@ function Open-Tunnel([string]$ProxyHost, [string]$Address, [int]$Port, [bool]$Pr
     $network = $client.GetStream(); $network.ReadTimeout = $TimeoutMs; $network.WriteTimeout = $TimeoutMs
     $stream = $network
     if ($ProxyTls) {
-        $outer = New-Object Net.Security.SslStream($network, $false)   # Windows validates the proxy certificate
-        try { $outer.AuthenticateAsClient($ProxyHost) } catch { $state.failure = 'TLS to the proxy failed or its certificate was rejected'; return [pscustomobject]$state }
+        # Windows validates the proxy certificate for the proxy NAME; the callback only records what it found.
+        $script:seenProxyErrors = [Net.Security.SslPolicyErrors]::None
+        $callback = [Net.Security.RemoteCertificateValidationCallback] { param($s, $c, $ch, $errors) $script:seenProxyErrors = $errors; return ($errors -eq [Net.Security.SslPolicyErrors]::None) }
+        $outer = New-Object Net.Security.SslStream($network, $false, $callback)
+        try { $outer.AuthenticateAsClient($ProxyHost) }
+        catch {
+            if ($script:seenProxyErrors -ne [Net.Security.SslPolicyErrors]::None) { $state.failure = 'certificate of the proxy REJECTED (' + $script:seenProxyErrors + ')' }
+            elseif (Test-TimeoutError $_.Exception) { $state.failure = 'TLS to the proxy: no answer (timeout), certificate not involved' }
+            else { $state.failure = 'TLS to the proxy broke off (network/protocol, ' + (Get-ExceptionChain $_.Exception) + '), certificate not involved' }
+            return [pscustomobject]$state
+        }
         $state.proxyTls = [string]$outer.SslProtocol
         $stream = $outer
     }
@@ -41,6 +54,38 @@ function Open-Tunnel([string]$ProxyHost, [string]$Address, [int]$Port, [bool]$Pr
     if ($state.connect -ne '200') { $state.failure = 'CONNECT answer ' + $state.connect; return [pscustomobject]$state }
     $state.stream = $stream
     return [pscustomobject]$state
+}
+function Test-TimeoutError($Exception) {
+    for ($e = $Exception; $null -ne $e; $e = $e.InnerException) {
+        if ($e -is [TimeoutException]) { return $true }
+        if ($e -is [Net.Sockets.SocketException] -and [string]$e.SocketErrorCode -eq 'TimedOut') { return $true }
+    }
+    return $false
+}
+function Get-ExceptionChain($Exception) {
+    $names = @(); for ($e = $Exception; $null -ne $e; $e = $e.InnerException) { $names += $e.GetType().Name }
+    return ($names -join ' <- ')
+}
+function Invoke-WrongNameCheck([string]$ProxyHost, [string[]]$Working, [int]$Port, [bool]$ProxyTls, [string]$Target, [int]$TimeoutMs) {
+    # The certificate of the target, received through a working proxy address, must be REFUSED for another name.
+    # Every working address is tried in turn until one answers again; the result names the address used. Without
+    # any working address, or if none answers again, the check is reported as NOT CHECKED (exit code 4), never as OK.
+    if (!@($Working).Count) { return [pscustomobject]@{ text = 'NOT CHECKED: no address works'; exitCode = 0 } }
+    $notes = @()
+    foreach ($endpoint in @($Working)) {
+        $address = ($endpoint -split ':')[0]
+        $tunnel = Open-Tunnel $ProxyHost $address $Port $ProxyTls $Target $TimeoutMs
+        try {
+            if ($tunnel.failure) { $notes += ($address + ': ' + $tunnel.failure); continue }
+            $handshake = $null
+            try { $s = [RuTrackerTls13]::Connect($tunnel.stream, $Target, 'example.com'); $s.Dispose(); $handshake = 'ACCEPTED' }
+            catch { $handshake = Get-Tls13Failure $_ }
+            if ($handshake -eq 'ACCEPTED') { return [pscustomobject]@{ text = 'VALIDATION FAILED via ' + $address + ': a certificate of ' + $Target + ' was accepted for example.com'; exitCode = 3 } }
+            if ($handshake -match '^TlsCertificateInvalid: ') { return [pscustomobject]@{ text = 'OK via ' + $address + ', refused (' + $handshake + ')'; exitCode = 0 } }
+            $notes += ($address + ': handshake did not reach the certificate (' + $handshake + ')')
+        } finally { if ($tunnel.client) { $tunnel.client.Close() } }
+    }
+    return [pscustomobject]@{ text = 'NOT CHECKED: none of the ' + @($Working).Count + ' working addresses answered again (' + ($notes -join '; ') + ')'; exitCode = 4 }
 }
 function Get-Tls13Failure($ErrorRecord) {
     $e = $ErrorRecord.Exception
@@ -88,19 +133,10 @@ if ($MyInvocation.InvocationName -ne '.') {
                 $report.Add($line + ' [' + [int]([DateTime]::UtcNow - $started).TotalMilliseconds + ' ms]')
             }
         }
-        # Mandatory negative check on the real certificate: another expected name must be refused.
-        $negative = 'not checked (no working address)'
-        if ($working.Count) {
-            $address = ($working[0] -split ':')[0]
-            $tunnel = Open-Tunnel $uri.Host $address $uri.Port ($uri.Scheme -eq 'https') $Target $timeout
-            try {
-                if ($tunnel.failure) { $negative = 'not checked: ' + $tunnel.failure }
-                else {
-                    try { $s = [RuTrackerTls13]::Connect($tunnel.stream, $Target, 'example.com'); $s.Dispose(); $negative = 'VALIDATION FAILED: a certificate of ' + $Target + ' was accepted for example.com'; $exitCode = 3 }
-                    catch { $negative = 'OK, refused (' + (Get-Tls13Failure $_) + ')' }
-                }
-            } finally { if ($tunnel.client) { $tunnel.client.Close() } }
-        }
+        # Mandatory negative check on the real certificate (Invoke-WrongNameCheck).
+        $check = Invoke-WrongNameCheck $uri.Host @($working) $uri.Port ($uri.Scheme -eq 'https') $Target $timeout
+        $negative = $check.text
+        if ($check.exitCode -gt 0 -and ($exitCode -eq 0 -or $check.exitCode -eq 3)) { $exitCode = $check.exitCode }
         $report.Add('Check that a wrong name is refused: ' + $negative)
         $report.Add('RESULT: ' + $working.Count + ' of ' + $addresses.Count + ' proxy addresses give a validated TLS 1.3 connection to ' + $Target + ' with an HTTP answer.')
         if (!$working.Count -and $exitCode -eq 0) { $exitCode = 2 }

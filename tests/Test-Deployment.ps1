@@ -96,7 +96,9 @@ $loginFiles = @('rutracker-proxy.txt', 'rutracker-credential.xml', 'rutracker-se
 function Assert-Updated($Env, [string]$Out, [string]$Case) {
     Assert ($Out -match 'Program files that differ: 0' -and $Out -match 'TLS component OK') "${Case}: update did not verify: $Out"
     $added = @([regex]::Matches($Out, '(?m)^data => (\S+)\s*$') | ForEach-Object { $_.Groups[1].Value } | Sort-Object)
-    Assert (($added -join ',') -eq 'rutracker-credential.xml,rutracker-proxy.txt,rutracker-session.xml,rutracker-state.json' -and $Out -notmatch 'data <=') "${Case}: data changed during the update: $Out"
+    # The learned order of proxy addresses comes along when 15-RuTracker-connection.cmd -Save wrote it in the release.
+    $expected = @($loginFiles); if (Test-Path -LiteralPath (Join-Path $Env.release 'rutracker-proxy-addresses.json')) { $expected += 'rutracker-proxy-addresses.json' }
+    Assert (($added -join ',') -eq ((@($expected) | Sort-Object) -join ',') -and $Out -notmatch 'data <=') "${Case}: data changed during the update: $Out"
     Assert ($Out -match '(?m)^\s*True\s*$' -and $Out -notmatch 'Найдено копий') "${Case}: release or tested copy not accepted: $Out"
     $backup = Get-Tree (Join-Path (Split-Path $Env.prod) 'backup-before-p0')
     Assert ($backup.Count -eq $Env.before.Count) "${Case}: backup incomplete ($($backup.Count) of $($Env.before.Count))"
@@ -133,6 +135,8 @@ try {
     # --- A: update while a poll holds the lock, then rollback in a new window --------------------------------
     $rootA = Join-Path $temp 'a'
     $envA = New-Environment $rootA
+    # As if 15-RuTracker-connection.cmd -Save had probed every proxy address in the release folder.
+    Write-Text (Join-Path $envA.release 'rutracker-proxy-addresses.json') '{"version":1,"proxy":"https://ps1.blockme.site:443","addresses":[]}'
     $lockPath = (Join-Path $envA.prod 'monitor.lock')
     if ($script:OnWindows) { $lockPath = $rootA + '\TorrentMonitor\monitor.lock' }
     $marker = Join-Path $rootA 'poll-started'
@@ -149,7 +153,7 @@ try {
     Assert ($out -match 'Идёт опрос, жду' -and ([DateTime]::UtcNow - $started).TotalSeconds -ge 3) "update did not wait for the running poll: $out"
     Assert-Updated $envA $out 'A'
     Assert-UpdatedState $envA 'A'
-    foreach ($name in $loginFiles) { Assert (Test-Path -LiteralPath (Join-Path $envA.prod $name)) "A: $name not copied from the tested copy" }
+    foreach ($name in $loginFiles + @('rutracker-proxy-addresses.json')) { Assert (Test-Path -LiteralPath (Join-Path $envA.prod $name)) "A: $name not copied" }
     $out = Invoke-Commands (Convert-Block $rollbackBlock $rootA) $rootA 'rollback'
     Assert-RolledBack $envA $out 'A'
 

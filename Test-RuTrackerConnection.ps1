@@ -1,4 +1,4 @@
-﻿param([string]$Proxy = '', [switch]$FindLocalProxy, [switch]$Save, [switch]$Interactive, [int]$TimeoutSec = 10, [switch]$NoOfficialProxy)
+﻿param([string]$Proxy = '', [switch]$FindLocalProxy, [switch]$Save, [switch]$Interactive, [int]$TimeoutSec = 10, [switch]$NoOfficialProxy, [switch]$NoAddressProbe)
 # Diagnosis of the network route from this computer to RuTracker for TorrentControl (15-RuTracker-connection.cmd).
 # Read-only for the computer: no DNS, route, registry, VPN, browser or Windows proxy setting is changed, Hiddify is
 # neither started nor configured. Every check is anonymous: no login, password, cookie or tracker address is used,
@@ -10,7 +10,11 @@
 #   -FindLocalProxy               also check the loopback ports on which Hiddify / sing-box listen (other programs,
 #                                 such as the uTorrent WebUI, are never probed);
 #   -Save / -Interactive          write the first working proxy to rutracker-proxy.txt in this folder (only after a
-#                                 successful check; -Interactive asks first).
+#                                 successful check; -Interactive asks first) and, for a proxy name with several
+#                                 addresses, what the check of every address found to rutracker-proxy-addresses.json
+#                                 (the starting order of addresses for TorrentControl; no secrets);
+#   (default for a proxy name)    every address of the name is also checked separately (certificate for the NAME);
+#                                 -NoAddressProbe skips that.
 # The report is shown and saved to rutracker-connection.txt (no secrets in it).
 $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\RuTracker.ps1"
@@ -20,7 +24,8 @@ $script:RouteTexts = @{
     DnsFailed = 'имя rutracker.org не разрешается DNS этого компьютера (обычная блокировка у провайдера)'
     ConnectFailed = 'адрес найден, но соединение с rutracker.org:443 не устанавливается (блокировка по адресу)'
     ProxyUnreachable = 'на этом адресе и порту ничего не принимает соединения: прокси не запущен, порт другой или Hiddify в режиме «VPN» (в нём локальный порт закрыт)'
-    ProxyTlsFailed = 'защищённое соединение с самим прокси не установлено{3}: прокси недоступен по TLS или его сертификат не прошёл проверку'
+    ProxyTlsFailed = 'защищённое соединение с самим прокси оборвалось или не ответило (сетевая ошибка TLS; сертификат не отклонялся)'
+    ProxyCertificateInvalid = 'сертификат прокси не прошёл проверку{3}: перебор адресов остановлен, ничего не отправлено'
     ProxyUnsupported = 'тип прокси не поддерживается (нужен http:// или https://)'
     ProxyAuthRequired = 'прокси требует пароль (HTTP 407); TorrentControl не хранит пароли прокси — нужен порт без авторизации'
     ProxyRefused = 'прокси не открыл туннель к rutracker.org:443 (ответ {0}); возможно, это не HTTP-прокси'
@@ -43,8 +48,28 @@ function Format-RouteResult($Result, [int]$TimeoutSec) {
     if ($tlsErrors) { $tlsErrors = ' (' + $tlsErrors + ')' }
     $text = $template -f $Result.ProxyStatus, $TimeoutSec, $script:StageTexts[[string]$Result.Stage], $tlsErrors, $Result.HttpStatus
     if ($Result.Ok) { $text += ' (HTTP ' + $Result.HttpStatus + ', ' + $Result.TlsVersion + ', сертификат rutracker.org в порядке)' }
-    if ([int]$Result.Attempts -gt 0) { $text += '; адрес прокси ' + $Result.Endpoint + ', попыток ' + $Result.Attempts + ' из ' + $Result.Addresses }
-    return ($text + ', ' + [math]::Round($Result.ElapsedMs / 1000.0, 1).ToString([Globalization.CultureInfo]::InvariantCulture) + ' с')
+    if ([int]$Result.Attempts -gt 0) {
+        $text += '; адрес прокси ' + $Result.Endpoint + ', попыток ' + $Result.Attempts + ' из ' + $Result.Addresses
+        if ([string]$Result.AddressSource -eq 'cache') { $text += ' (DNS не ответил — запомненные адреса)' }
+    }
+    return ($text + ', ' + (Format-Seconds $Result.ElapsedMs))
+}
+function Format-Seconds([long]$Ms) { return ([math]::Round($Ms / 1000.0, 1).ToString([Globalization.CultureInfo]::InvariantCulture) + ' с') }
+$script:AddressTexts = @{
+    ProxyUnreachable = 'нет TCP-соединения'; ProxyTlsFailed = 'TLS с прокси оборвался или не ответил (сетевая ошибка)'
+    ProxyCertificateInvalid = 'сертификат прокси отклонён'; ProxyRefused = 'туннель CONNECT не открыт'; ProxyAuthRequired = 'прокси требует пароль'
+    TlsFailed = 'TLS с rutracker.org не установлен'; TlsCertificateInvalid = 'сертификат rutracker.org отклонён'
+    HttpForbidden = 'rutracker.org ответил 403'; HttpRateLimited = 'rutracker.org ответил 429'; HttpUnexpected = 'неожиданный ответ rutracker.org'
+}
+function Format-AddressProbe($Result) {
+    # One line per proxy address: what the person needs to see why some addresses do not work.
+    $address = [string]$Result.Endpoint
+    if ($Result.Ok) { return ($address + ': РАБОТАЕТ (' + $Result.TlsVersion + ', HTTP ' + $Result.HttpStatus + '), ' + (Format-Seconds $Result.ElapsedMs)) }
+    $text = $script:AddressTexts[[string]$Result.Code]
+    if ([string]$Result.Code -eq 'Timeout') { $text = 'нет ответа (этап: ' + $script:StageTexts[[string]$Result.Stage] + ')' }
+    if (!$text) { $text = 'ошибка ' + [string]$Result.Code }
+    if ([string]$Result.TlsErrors) { $text += ' (' + [string]$Result.TlsErrors + ')' }
+    return ($address + ': ' + $text + ', ' + (Format-Seconds $Result.ElapsedMs))
 }
 function Get-ListeningSockets {
     # Read-only list of listening TCP ports with the owning process (Windows NetTCPIP module); $null if unavailable.
@@ -76,7 +101,7 @@ function Get-LocalProxyCandidates($Sockets) {
     }
     return $list.ToArray()   # callers wrap the result in @()
 }
-function Invoke-RuTrackerDiagnostics([string]$Directory, [string]$Proxy = '', [switch]$FindLocalProxy, [int]$TimeoutSec = 10, [switch]$NoOfficialProxy) {
+function Invoke-RuTrackerDiagnostics([string]$Directory, [string]$Proxy = '', [switch]$FindLocalProxy, [int]$TimeoutSec = 10, [switch]$NoOfficialProxy, [switch]$NoAddressProbe) {
     $timeout = [math]::Max(1, $TimeoutSec)
     $lines = New-Object Collections.Generic.List[string]
     $lines.Add('Проверка доступа TorrentControl к RuTracker — ' + (Get-Date -Format 'yyyy-MM-dd HH:mm:ss'))
@@ -114,13 +139,24 @@ function Invoke-RuTrackerDiagnostics([string]$Directory, [string]$Proxy = '', [s
         }
     }
     $working = ''
+    $probes = @{}
     $checked = @{}
     foreach ($candidate in $candidates) {
         if ($checked.ContainsKey($candidate.url)) { continue }
         $checked[$candidate.url] = $true
         $result = Invoke-RuTrackerRouteCheck $candidate.url 'rutracker.org' ($timeout * 1000)
         $lines.Add('   ' + $candidate.url + ' (' + $candidate.source + '): ' + (Format-RouteResult $result $timeout))
-        if ($result.Ok -and !$working) { $working = $candidate.url }
+        $ok = [bool]$result.Ok
+        # A proxy name with several addresses: each address separately, so that a few broken ones are seen as such.
+        $each = @()
+        if (!$NoAddressProbe) { $each = @(Invoke-RuTrackerAddressProbe $candidate.url ($timeout * 1000)) }
+        if ($each.Count -gt 1) {
+            foreach ($probe in $each) { $lines.Add('      ' + (Format-AddressProbe $probe)) }
+            $good = @($each | Where-Object { $_.Ok }).Count
+            $lines.Add('      Рабочих адресов: ' + $good + ' из ' + $each.Count + '. TorrentControl начинает с последнего рабочего адреса и пропускает неотвечающие.')
+            if ($good -gt 0) { $ok = $true; $probes[$candidate.url] = $each }
+        }
+        if ($ok -and !$working) { $working = $candidate.url }
     }
     if ($direct.Ok) { $lines.Add('ИТОГ: rutracker.org доступен напрямую; прокси не нужен.') }
     elseif ($working) { $lines.Add('ИТОГ: рабочий маршрут через ' + $working + '. Для TorrentControl в rutracker-proxy.txt должна быть строка: ' + $working) }
@@ -133,7 +169,9 @@ function Invoke-RuTrackerDiagnostics([string]$Directory, [string]$Proxy = '', [s
         $lines.Add(' 4. Повторите проверку: Test-RuTrackerConnection.ps1 -Proxy http://127.0.0.1:<этот порт>')
         $lines.Add('Других внешних прокси, кроме официального прокси RuTracker из его расширения, TorrentControl не предлагает и не использует.')
     }
-    return [pscustomobject]@{ lines = $lines.ToArray(); working = $working; directOk = [bool]$direct.Ok; configured = $configured }
+    $probe = $null
+    if ($working -and $probes.ContainsKey($working)) { $probe = $probes[$working] }
+    return [pscustomobject]@{ lines = $lines.ToArray(); working = $working; directOk = [bool]$direct.Ok; configured = $configured; probe = $probe }
 }
 function Save-RuTrackerProxy([string]$Directory, [string]$Url) {
     $value = ConvertTo-RuTrackerProxy $Url
@@ -144,13 +182,17 @@ function Save-RuTrackerProxy([string]$Directory, [string]$Url) {
 
 if ($MyInvocation.InvocationName -ne '.') {
     try {
-        $report = Invoke-RuTrackerDiagnostics $PSScriptRoot $Proxy -FindLocalProxy:$FindLocalProxy $TimeoutSec -NoOfficialProxy:$NoOfficialProxy
+        $report = Invoke-RuTrackerDiagnostics $PSScriptRoot $Proxy -FindLocalProxy:$FindLocalProxy $TimeoutSec -NoOfficialProxy:$NoOfficialProxy -NoAddressProbe:$NoAddressProbe
         foreach ($line in $report.lines) { Write-Host $line }
         [IO.File]::WriteAllLines((Join-Path $PSScriptRoot 'rutracker-connection.txt'), [string[]]$report.lines, (New-Object Text.UTF8Encoding($true)))
-        if ($report.working -and $report.working -ne $report.configured) {
+        if ($report.working -and ($report.working -ne $report.configured -or $report.probe)) {
             $write = [bool]$Save
             if (!$write -and $Interactive) { $write = ((Read-Host ('Записать ' + $report.working + ' в rutracker-proxy.txt этой папки? Введите YES')).Trim() -eq 'YES') }
-            if ($write) { $null = Save-RuTrackerProxy $PSScriptRoot $report.working; Write-Host ('Записано в rutracker-proxy.txt: ' + $report.working) }
+            if ($write -and $report.working -ne $report.configured) { $null = Save-RuTrackerProxy $PSScriptRoot $report.working; Write-Host ('Записано в rutracker-proxy.txt: ' + $report.working) }
+            if ($write -and $report.probe) {
+                Save-RuTrackerAddressProbe $PSScriptRoot $report.working $report.probe
+                Write-Host ('Записан порядок адресов прокси (rutracker-proxy-addresses.json): рабочих ' + @($report.probe | Where-Object { $_.Ok }).Count + ' из ' + @($report.probe).Count + '.')
+            }
         }
         if ($report.directOk -or $report.working) { exit 0 }
         exit 2
