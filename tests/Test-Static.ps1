@@ -111,6 +111,7 @@ Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect'
 Assert (([regex]::Matches($ru, [regex]::Escape('[RuTrackerRoute]::Send('))).Count -eq 1 -and $ru -notmatch 'Invoke-WebRequest|WebRequest\]::Create|HttpClient|Net\.WebProxy') 'RuTracker requests must go through RuTrackerRoute.cs only'
 Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
 $diagnostics = [IO.File]::ReadAllText((Join-Path $repo 'Test-RuTrackerConnection.ps1'))
+Assert ($diagnostics.Contains('. "$PSScriptRoot\AutoLoad.ps1"')) 'standalone RuTracker diagnostics must load atomic JSON writer for proxy address history'
 foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Import-Clixml', 'Invoke-RuTrackerLogin', 'Get-PersonalTorrent', 'Invoke-RuTrackerHttp', 'Start-Process', 'Stop-Process', 'Set-Content', 'Out-File')) {
     Assert ($diagnostics -notmatch $pattern) "Test-RuTrackerConnection.ps1 must stay anonymous and read-only: '$pattern'"
 }
