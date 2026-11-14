@@ -24,7 +24,7 @@ $networkBefore = Get-NetworkSnapshot
 $temp = New-TestDirectory
 $savedLocal = $env:LOCALAPPDATA
 $proxies = New-Object Collections.Generic.List[object]
-function New-FakeProxy([string]$Mode) { $p = New-Object FakeProxy($Mode); $proxies.Add($p); return $p }
+function New-FakeProxy([string]$Mode, [string]$Response = '') { $p = New-Object FakeProxy($Mode, $Response); $proxies.Add($p); return $p }
 try {
     $env:LOCALAPPDATA = Join-Path $temp 'LocalAppData'
     $secrets = @('FAKE-PASSWORD-NET-1', '0-FAKE-COOKIE-NET-2', 'login_password', 'bb_session', '/forum/', 'Cookie:', 'Authorization')
@@ -132,6 +132,70 @@ try {
     Assert (!(Test-Path -LiteralPath (Join-Path $env:LOCALAPPDATA 'TorrentControl\personal'))) 'a file was written after a network failure'
     Assert (!(Read-RuTrackerState $app).blocked) 'network failure blocked automatic logins'
 
+    # --- HTTP/1.1 exchange of the transport (parser over plain sockets; production always runs it inside TLS) ------
+    function Invoke-Exchange([string]$Response, [string]$Method = 'GET', [string]$Url = 'https://rutracker.org/forum/dl.php?t=1', $Cookies = $null, [byte[]]$Body = $null, [int]$Max = 4000000) {
+        $server = New-FakeProxy 'respond' $Response
+        $client = New-Object Net.Sockets.TcpClient('127.0.0.1', $server.Port)
+        try {
+            $stream = $client.GetStream(); $stream.ReadTimeout = 5000
+            $type = ''; if ($null -ne $Body) { $type = 'application/x-www-form-urlencoded' }
+            $result = $null; $code = ''
+            try { $result = [RuTrackerRoute]::Exchange($stream, $Method, [Uri]$Url, $Cookies, $type, $Body, 'TorrentControl-test', $Max) }
+            catch { $e = $_.Exception; while ($null -ne $e -and $e -isnot [RuTrackerRouteFailure]) { $e = $e.InnerException }; if ($null -ne $e) { $code = $e.Code } else { throw } }
+            return [pscustomobject]@{ result = $result; code = $code; request = (Get-ProxyText $server); server = $server }
+        } finally { $client.Close() }
+    }
+    $cookies = New-Object Net.CookieContainer
+    $cookies.Add([Uri]'https://rutracker.org/forum/', (New-Object Net.Cookie('bb_session', '0-FAKE-COOKIE-NET-2')))
+    $x = Invoke-Exchange "HTTP/1.1 200 OK`r`nContent-Type: application/x-bittorrent`r`nContent-Length: 5`r`n`r`nd1:ae" -Cookies $cookies
+    Assert ($x.result.Status -eq 200 -and $x.result.ContentType -eq 'application/x-bittorrent' -and [Text.Encoding]::ASCII.GetString($x.result.Body) -eq 'd1:ae') 'Content-Length body'
+    Assert ($x.request -match '^GET /forum/dl\.php\?t=1 HTTP/1\.1\r\nHost: rutracker\.org\r\n' -and $x.request -match 'Cookie: bb_session=0-FAKE-COOKIE-NET-2' -and $x.request -match 'Accept-Encoding: identity' -and $x.request -match 'Connection: close') "request: $($x.request)"
+    $x = Invoke-Exchange "HTTP/1.1 200 OK`r`nTransfer-Encoding: chunked`r`n`r`n4;ext=1`r`nd1:a`r`n1`r`ne`r`n0`r`nX-Trailer: y`r`n`r`n"
+    Assert ($x.result.Status -eq 200 -and [Text.Encoding]::ASCII.GetString($x.result.Body) -eq 'd1:ae') 'chunked body with extension and trailer'
+    $x = Invoke-Exchange ("HTTP/1.1 302 Found`r`nLocation: https://evil.example/collect`r`nSet-Cookie: bb_guid=FAKEguid; path=/forum/; domain=.rutracker.org`r`n" +
+        "Set-Cookie: evil=1; domain=.evil.example; path=/`r`nSet-Cookie: bb_t=FAKEt; expires=Wed, 01-Jan-2031 00:00:00 GMT; path=/forum/`r`nContent-Length: 0`r`n`r`n") -Method 'POST' -Cookies $cookies -Body ([Text.Encoding]::ASCII.GetBytes('login_password=FAKE-PASSWORD-NET-1'))
+    Assert ($x.result.Status -eq 302 -and $x.result.Location -eq 'https://evil.example/collect' -and @($x.server.Requests).Count -eq 1) 'redirect followed or Location lost'
+    Assert ($x.request -match 'Content-Type: application/x-www-form-urlencoded\r\nContent-Length: 34\r\n\r\nlogin_password=FAKE-PASSWORD-NET-1$') 'form body not sent as declared'
+    $names = @($cookies.GetCookies([Uri]'https://rutracker.org/forum/') | ForEach-Object { $_.Name })
+    Assert ($names -contains 'bb_guid' -and $names -contains 'bb_t' -and $names -contains 'bb_session') "cookies not stored: $($names -join ',')"
+    Assert (@($cookies.GetCookies([Uri]'https://evil.example/')).Count -eq 0) 'cookie for another domain accepted'
+    $x = Invoke-Exchange "HTTP/1.1 200 OK`r`nContent-Length: 0`r`n`r`n" -Url 'https://static.rutracker.cc/captcha/a.jpg' -Cookies $cookies
+    Assert ($x.request -notmatch 'Cookie:') 'rutracker.org cookie sent to another host'
+    foreach ($case in @(
+        @("HTTP/1.1 200 OK`r`nContent-Length: 5000`r`n`r`nxx", 100, 'ResponseTooLarge'),
+        @("HTTP/1.1 200 OK`r`nTransfer-Encoding: chunked`r`n`r`n80`r`n$('x' * 128)`r`n0`r`n`r`n", 100, 'ResponseTooLarge'),
+        @("HTTP/1.1 200 OK`r`n`r`n$('x' * 300)", 100, 'ResponseTooLarge'),
+        @("HTTP/1.1 200 OK`r`nContent-Length: 10`r`n`r`nabc", 4000000, 'HttpUnexpected'),
+        @("garbage without a status line`r`n`r`n", 4000000, 'HttpUnexpected'),
+        @("HTTP/1.1 200 OK`r`nContent-Le", 4000000, 'HttpUnexpected'),
+        @("HTTP/1.1 200 OK`r`nTransfer-Encoding: chunked`r`n`r`nzz`r`n", 4000000, 'HttpUnexpected'))) {
+        $x = Invoke-Exchange $case[0] -Max $case[1]
+        Assert ($x.code -eq $case[2]) "malformed or oversized answer: expected $($case[2]), got '$($x.code)'"
+    }
+
+    # --- https:// proxies (TLS to the proxy, as the official RuTracker extension uses) ------------------------
+    $tlsProxy = New-FakeProxy 'tls-garbage'
+    $r = [RuTrackerRoute]::Check('https', '127.0.0.1', $tlsProxy.Port, 'rutracker.org', '/forum/index.php', 3000)
+    Assert (!$r.Ok -and $r.Code -eq 'ProxyTlsFailed' -and $r.Stage -eq 'ProxyTls') "https proxy without TLS: $($r.Code)/$($r.Stage)"
+    Start-Sleep -Milliseconds 200
+    Assert (@($tlsProxy.TunnelBytes)[0][0] -eq 22 -and ([Text.Encoding]::ASCII.GetString(@($tlsProxy.TunnelBytes)[0]) -notmatch 'CONNECT')) 'CONNECT sent before TLS to the https proxy'
+    $r = [RuTrackerRoute]::Check('https', '127.0.0.1', $closed, 'rutracker.org', '/forum/index.php', 8000)
+    Assert ($r.Code -eq 'ProxyUnreachable' -and $r.Stage -eq 'ProxyConnect') "closed https proxy: $($r.Code)"
+    $r = [RuTrackerRoute]::Check('https', '127.0.0.1', (New-FakeProxy 'silent').Port, 'rutracker.org', '/forum/index.php', 1500)
+    Assert ($r.Code -eq 'Timeout' -and $r.Stage -eq 'ProxyTls') "silent https proxy: $($r.Code)/$($r.Stage)"
+    $r = [RuTrackerRoute]::Check('socks5', '127.0.0.1', $closed, 'rutracker.org', '/forum/index.php', 1500)
+    Assert ($r.Code -eq 'ProxyUnsupported') 'unsupported proxy type accepted'
+    $send = [RuTrackerRoute]::Send('https', '127.0.0.1', (New-FakeProxy 'tls-garbage').Port, 'POST', 'https://rutracker.org/forum/login.php', $cookies, 'application/x-www-form-urlencoded',
+        [Text.Encoding]::ASCII.GetBytes('login_password=FAKE-PASSWORD-NET-1'), 'TorrentControl-test', 3000, 4000000)
+    Assert ($send.Status -eq 0 -and $send.Error -eq 'ProxyTlsFailed') "request through a broken https proxy: $($send.Error)"
+    $send = [RuTrackerRoute]::Send('', '', 0, 'GET', 'http://rutracker.org/forum/dl.php?t=1', $cookies, '', $null, 'TorrentControl-test', 3000, 4000000)
+    Assert ($send.Error -eq 'UnsupportedUrl') 'plain http accepted by the transport'
+    $send = [RuTrackerRoute]::Send('http', '127.0.0.1', (New-FakeProxy 'connect-403').Port, 'GET', 'https://rutracker.org/forum/dl.php?t=1', $cookies, '', $null, 'TorrentControl-test', 3000, 4000000)
+    Assert ($send.Error -eq 'ProxyRefused' -and $send.ProxyStatus -eq 403) "refused tunnel: $($send.Error)/$($send.ProxyStatus)"
+    $script:RuTrackerProxy = 'https://127.0.0.1:' + (New-FakeProxy 'tls-garbage').Port
+    $response = Invoke-RuTrackerHttp 'Get' 'https://rutracker.org/forum/dl.php?t=1' (New-RuTrackerSession 'bb_session=0-FAKE-COOKIE-NET-2')
+    Assert ($response.status -eq 0 -and (Get-RuTrackerFailureCode $response.error) -eq 'RuTrackerProxyUnavailable') "https proxy failure code: $($response.error)"
+
     # --- Diagnostics (Test-RuTrackerConnection.ps1) -----------------------------------------------------------
     $hiddify = New-FakeProxy 'connect-403'
     $webui = New-FakeProxy 'connect-garbage'     # stands for the uTorrent WebUI: must never be probed
@@ -147,9 +211,12 @@ try {
     $script:credentialRead = $false
     function Read-RuTrackerCredential([string]$Directory) { $script:credentialRead = $true; return $null }
     function Get-ListeningSockets { return ,$sockets }
+    # The official RuTracker proxy is never contacted by the tests: its answer is simulated.
+    $script:officialResult = [pscustomobject]@{ Ok = $false; Code = 'ProxyTlsFailed'; Stage = 'ProxyTls'; ProxyStatus = 0; HttpStatus = 0; TlsErrors = 'RemoteCertificateChainErrors'; Addresses = 0; ElapsedMs = 900 }
     function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
         [void]$script:checks.Add($Proxy)
         if (!$Proxy) { return [RuTrackerRoute]::Check('', 0, 'rutracker.invalid', '/forum/index.php', 5000) }   # direct: DNS failure
+        if ($Proxy -eq 'https://ps1.blockme.site:443') { return $script:officialResult }
         if ($Proxy -eq 'http://127.0.0.1:12334') { return [pscustomobject]@{ Ok = $true; Code = 'Ok'; Stage = 'Http'; ProxyStatus = 200; HttpStatus = 200; TlsErrors = ''; Addresses = 0; ElapsedMs = 420 } }
         $uri = [Uri]$Proxy
         return [RuTrackerRoute]::Check($uri.Host, $uri.Port, 'rutracker.org', '/forum/index.php', $TimeoutMs)
@@ -166,6 +233,7 @@ try {
     Assert ($text -match 'DNS rutracker\.org на этом компьютере: (имя rutracker\.org не разрешается|нет ответа)' -and $text -match 'http://127\.0\.0\.1:12334 \(процесс Hiddify\): РАБОТАЕТ') "report: $text"
     Assert ($text -match ('http://127\.0\.0\.1:' + $hiddify.Port + ' \(процесс HiddifyCli\): прокси не открыл туннель к rutracker\.org:443 \(ответ 403\)')) "refused proxy not explained: $text"
     Assert ($text -match 'ИТОГ: рабочий маршрут через http://127\.0\.0\.1:12334') 'verdict missing'
+    Assert ($script:checks -contains 'https://ps1.blockme.site:443' -and $text -match 'https://ps1\.blockme\.site:443 \(официальный прокси RuTracker, тот же, что у расширения Firefox\): защищённое соединение с самим прокси не установлено \(RemoteCertificateChainErrors\)') "official proxy not checked or not explained: $text"
     Assert ((Get-ProxyText $webui) -eq '' -and $script:checks -notcontains ('http://127.0.0.1:' + $webui.Port)) 'the uTorrent WebUI port was probed'
     Assert (!$script:credentialRead) 'diagnostics read the RuTracker credential'
     foreach ($s in $secrets + @('FAKE')) { Assert ($text -notmatch [regex]::Escape($s)) "report contains '$s'" }
@@ -173,14 +241,27 @@ try {
     Assert ((Save-RuTrackerProxy $diag $report.working) -eq 'http://127.0.0.1:12334' -and (Read-RuTrackerProxy $diag) -eq 'http://127.0.0.1:12334') 'proxy not saved'
     Assert-Throws { Save-RuTrackerProxy $diag 'socks5://127.0.0.1:12334' } 'RuTrackerProxyInvalid' 'SOCKS proxy saved'
     Assert-Throws { Invoke-RuTrackerDiagnostics $diag 'http://user:pw@127.0.0.1:1' } 'RuTrackerProxyInvalid' 'proxy with a password accepted'
+    # The official RuTracker proxy works (as in Firefox): it becomes the route, saved only on request.
+    $script:officialResult = [pscustomobject]@{ Ok = $true; Code = 'Ok'; Stage = 'Http'; ProxyStatus = 200; HttpStatus = 200; TlsErrors = ''; Addresses = 0; ElapsedMs = 700 }
+    $official = Join-Path $temp 'official'
+    $null = Microsoft.PowerShell.Management\New-Item -Path $official -ItemType Directory
+    $report = Invoke-RuTrackerDiagnostics $official '' 3
+    Assert ($report.working -eq 'https://ps1.blockme.site:443' -and ($report.lines -join "`n") -match 'ИТОГ: рабочий маршрут через https://ps1\.blockme\.site:443') "official route not reported: $($report.working)"
+    Assert (!(Test-Path -LiteralPath (Join-Path $official 'rutracker-proxy.txt'))) 'official proxy saved without consent'
+    Assert ((Save-RuTrackerProxy $official $report.working) -eq 'https://ps1.blockme.site:443' -and (Read-RuTrackerProxy $official) -eq 'https://ps1.blockme.site:443') 'official proxy not saved on request'
+    $script:checks.Clear()
+    $null = Invoke-RuTrackerDiagnostics $official '' 3 -NoOfficialProxy
+    Assert ($script:checks -contains 'https://ps1.blockme.site:443') 'a configured official proxy was not checked'
+    $script:checks.Clear()
     # Nothing works: Hiddify guidance, no external proxy suggested, nothing saved.
     function Get-ListeningSockets { return ,@() }
     $empty = Join-Path $temp 'empty'
     $null = Microsoft.PowerShell.Management\New-Item -Path $empty -ItemType Directory
-    $report = Invoke-RuTrackerDiagnostics $empty ('http://127.0.0.1:' + $closed) -FindLocalProxy 8
+    $report = Invoke-RuTrackerDiagnostics $empty ('http://127.0.0.1:' + $closed) -FindLocalProxy 8 -NoOfficialProxy
     $text = $report.lines -join "`n"
     Assert (!$report.working -and $text -match 'ничего не принимает соединения' -and $text -match 'не найдены') "unreachable proxy not explained: $text"
-    Assert ($text -match '«Режим службы» → «Только прокси»' -and $text -match '«Порт прокси \(SOCKS5/4, HTTP\)»' -and $text -match 'Внешние прокси из интернета автоматически не предлагаются') 'Hiddify guidance missing'
+    Assert ($text -match '«Режим службы» → «Только прокси»' -and $text -match '«Порт прокси \(SOCKS5/4, HTTP\)»' -and $text -match 'Других внешних прокси, кроме официального прокси RuTracker из его расширения, TorrentControl не предлагает') 'Hiddify guidance missing'
+    Assert ($script:checks -notcontains 'https://ps1.blockme.site:443') 'official proxy checked despite -NoOfficialProxy'
     Assert ($text -notmatch 'blockme|https?://(?!127\.0\.0\.1)[a-z]') 'an external proxy was suggested'
     Assert (!(Test-Path -LiteralPath (Join-Path $empty 'rutracker-proxy.txt'))) 'proxy file written although nothing works'
 } finally {

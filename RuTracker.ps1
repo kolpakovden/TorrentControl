@@ -22,8 +22,12 @@ $script:NeutralTrackerHosts = @('retracker.local')
 $script:RuTrackerSecrets = New-Object Collections.Generic.List[string]
 # At most one automatic login per this many minutes (repeated logins are what makes RuTracker ask for a CAPTCHA).
 $script:RuTrackerLoginPauseMinutes = 30
-# Route to RuTracker: rutracker-proxy.txt (an HTTP proxy such as Hiddify's local port, HTTP CONNECT for HTTPS),
-# otherwise the Windows proxy setting, otherwise direct. Only RuTracker requests of TorrentControl use it.
+# Route to RuTracker: rutracker-proxy.txt (http:// proxy such as Hiddify's local port, or https:// proxy such as the
+# one of the official RuTracker extension), otherwise the Windows proxy setting, otherwise direct. Only RuTracker
+# requests of TorrentControl use it. The official extension (Firefox add-on "rutracker-add-on" 0.9.32, MPL-2.0)
+# sends rutracker.org, static.rutracker.cc and api.rutracker.cc through "HTTPS ps1.blockme.site:443"; it is offered by
+# Test-RuTrackerConnection.ps1 and used only after the person writes it to rutracker-proxy.txt.
+$script:RuTrackerOfficialProxy = 'https://ps1.blockme.site:443'
 $script:RuTrackerProxy = ''
 $script:RuTrackerTimeoutMs = 30000
 $script:RuTrackerCheckTimeoutMs = 15000
@@ -187,12 +191,18 @@ function Read-RuTrackerProxy([string]$Directory) {
     return (ConvertTo-RuTrackerProxy "$(Get-Content -LiteralPath $path -Raw)")
 }
 function ConvertTo-RuTrackerProxy([string]$Text) {
-    # http://host:port only: an HTTP proxy that supports CONNECT; no user name or password in the address.
+    # http://host:port - HTTP proxy with CONNECT; https://host:port - the same through TLS to the proxy (as the
+    # official RuTracker extension does). No user name or password in the address. Returns scheme://host:port.
     $Text = $Text.Trim()
     $uri = $null
-    if (![Uri]::TryCreate($Text, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -ne 'http' -or $uri.UserInfo -or
+    if (![Uri]::TryCreate($Text, [UriKind]::Absolute, [ref]$uri) -or $uri.Scheme -notin @('http', 'https') -or $uri.UserInfo -or
         $uri.AbsolutePath -ne '/' -or $uri.Query -or $uri.Fragment -or $uri.Host -notmatch '^[A-Za-z0-9.-]{1,253}$') { throw 'RuTrackerProxyInvalid' }
-    return $uri.GetLeftPart([UriPartial]::Authority)
+    return ($uri.Scheme + '://' + $uri.Host.ToLowerInvariant() + ':' + $uri.Port)
+}
+function Get-RuTrackerRouteParts([string]$Proxy) {
+    if (!$Proxy) { return [pscustomobject]@{ scheme = ''; host = ''; port = 0 } }
+    $uri = [Uri](ConvertTo-RuTrackerProxy $Proxy)
+    return [pscustomobject]@{ scheme = $uri.Scheme; host = $uri.Host; port = $uri.Port }
 }
 function Get-SystemRuTrackerProxy {
     # Read-only look at the Windows proxy setting for rutracker.org; used only when rutracker-proxy.txt is absent.
@@ -210,19 +220,13 @@ function Resolve-RuTrackerProxy([string]$Directory) {
     if (!$proxy) { $proxy = Get-SystemRuTrackerProxy }
     return $proxy
 }
-function Get-RuTrackerWebProxy {
-    # Set explicitly on every request: the chosen HTTP proxy (HTTPS goes through HTTP CONNECT, TLS stays end-to-end
-    # with rutracker.org) or a direct connection.
-    if ($script:RuTrackerProxy) { return (New-Object Net.WebProxy($script:RuTrackerProxy, $false)) }
-    return (New-Object Net.WebProxy)
-}
 function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
-    # Anonymous: TCP, CONNECT, TLS with normal certificate validation, status of /forum/index.php (RuTrackerRoute.cs).
+    # Anonymous: TCP, TLS to an https proxy, CONNECT, TLS with normal certificate validation, status of
+    # /forum/index.php (RuTrackerRoute.cs). No cookie or credential.
     if (!('RuTrackerRoute' -as [type])) { Add-Type -Path "$PSScriptRoot\RuTrackerRoute.cs" }
     if ($TimeoutMs -le 0) { $TimeoutMs = $script:RuTrackerCheckTimeoutMs }
-    $proxyHost = ''; $port = 0
-    if ($Proxy) { $uri = [Uri]$Proxy; $proxyHost = $uri.DnsSafeHost; $port = $uri.Port }
-    return [RuTrackerRoute]::Check($proxyHost, $port, $HostName, '/forum/index.php', $TimeoutMs)
+    $route = Get-RuTrackerRouteParts $Proxy
+    return [RuTrackerRoute]::Check($route.scheme, $route.host, $route.port, $HostName, '/forum/index.php', $TimeoutMs)
 }
 function Get-RuTrackerNetError($Exception) {
     # A fixed network code from the exception chain; the message (which may quote a URL) is never used.
@@ -253,7 +257,7 @@ function Get-RuTrackerNetError($Exception) {
 function Get-RuTrackerFailureCode([string]$NetCode) {
     # Network code -> TorrentControl code for the journal (no public fallback for any of them).
     $viaProxy = [bool]$script:RuTrackerProxy
-    if ($NetCode -in @('ProxyUnreachable', 'ProxyRefused', 'ProxyAuthRequired')) { return 'RuTrackerProxyUnavailable' }
+    if ($NetCode -in @('ProxyUnreachable', 'ProxyRefused', 'ProxyAuthRequired', 'ProxyTlsFailed', 'ProxyUnsupported')) { return 'RuTrackerProxyUnavailable' }
     if ($NetCode -in @('DnsFailed', 'ConnectFailed', 'Timeout', 'NetworkError')) { if ($viaProxy) { return 'RuTrackerProxyUnavailable' }; return 'RuTrackerUnavailable' }
     if ($NetCode -in @('TlsFailed', 'TlsCertificateInvalid')) { return 'RuTrackerTlsFailed' }
     if ($NetCode -in @('HttpForbidden', 'HttpRateLimited')) { return 'RuTrackerBlocked' }
@@ -284,59 +288,23 @@ function ConvertTo-FormValue([string]$Value) {
     return $out.ToString()
 }
 function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$Form = '') {
-    # HTTPS to rutracker.org/forum/ and CAPTCHA images only. Redirects are never followed here (the caller decides),
-    # so a password or a cookie is never carried to another address. Certificate validation is the default one;
-    # on any network or TLS failure only a fixed code is returned. Replaced by stubs in most tests.
+    # HTTPS to rutracker.org/forum/ and CAPTCHA images only, through the chosen route (RuTrackerRoute.cs: direct,
+    # http:// or https:// proxy). Redirects are never followed here (the caller decides), so a password or a cookie is
+    # never carried to another address. Certificates are validated as usual; on any network or TLS failure only a
+    # fixed code is returned, never an exception text. Replaced by stubs in most tests.
     if ($Url -notmatch '^https://(rutracker\.org/forum/|static\.rutracker\.cc/captcha/)') { throw 'RuTrackerRedirectRefused' }
-    $tls = [Net.ServicePointManager]::SecurityProtocol
-    $response = $null
-    $failed = { param($Exception) [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = (Get-RuTrackerNetError $Exception) } }
+    if (!('RuTrackerRoute' -as [type])) { Add-Type -Path "$PSScriptRoot\RuTrackerRoute.cs" }
+    $route = Get-RuTrackerRouteParts $script:RuTrackerProxy
+    $body = $null; $type = ''
+    if ($Form) { $body = [Text.Encoding]::ASCII.GetBytes($Form); $type = 'application/x-www-form-urlencoded' }
     try {
-        [Net.ServicePointManager]::SecurityProtocol = $tls -bor [Net.SecurityProtocolType]::Tls12
-        $request = [Net.WebRequest]::Create($Url)
-        $request.Method = $Method.ToUpperInvariant()
-        $request.AllowAutoRedirect = $false
-        $request.CookieContainer = $Session.Cookies
-        $request.Proxy = Get-RuTrackerWebProxy
-        $request.Timeout = $script:RuTrackerTimeoutMs
-        $request.ReadWriteTimeout = $script:RuTrackerTimeoutMs
-        $request.UserAgent = $script:RuTrackerUserAgent
-        # Timeouts are enforced here: .NET Framework does not apply HttpWebRequest.Timeout while it waits for the
-        # proxy's answer to CONNECT, so a silent proxy would otherwise hang the request.
-        if ($Form) {
-            $body = [Text.Encoding]::ASCII.GetBytes($Form)
-            $request.ContentType = 'application/x-www-form-urlencoded'
-            $request.ContentLength = $body.Length
-            $pending = $request.BeginGetRequestStream($null, $null)
-            if (!$pending.AsyncWaitHandle.WaitOne($script:RuTrackerTimeoutMs)) { $request.Abort(); return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
-            $upload = $request.EndGetRequestStream($pending)
-            try { $upload.Write($body, 0, $body.Length) } finally { $upload.Dispose() }
-        }
-        try {
-            $pending = $request.BeginGetResponse($null, $null)
-            if (!$pending.AsyncWaitHandle.WaitOne($script:RuTrackerTimeoutMs)) { $request.Abort(); return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
-            $response = $request.EndGetResponse($pending)
-        }
-        catch {
-            $web = $_.Exception
-            while ($null -ne $web -and $web -isnot [Net.WebException]) { $web = $web.InnerException }
-            if ($null -eq $web -or $null -eq $web.Response) { return (& $failed $_.Exception) }
-            $response = $web.Response   # an HTTP error status (404, 429...) is a normal answer here
-        }
-        $buffer = New-Object byte[] 65536
-        $memory = New-Object IO.MemoryStream
-        $download = $response.GetResponseStream()
-        try {
-            while (($read = $download.Read($buffer, 0, $buffer.Length)) -gt 0) { $memory.Write($buffer, 0, $read); if ($memory.Length -gt 4000000) { break } }
-        } finally { $download.Dispose() }
-        return [pscustomobject]@{ status = [int]$response.StatusCode; contentType = [string]$response.ContentType; bytes = $memory.ToArray()
-            location = [string]$response.Headers['Location']; error = '' }
+        $answer = [RuTrackerRoute]::Send($route.scheme, $route.host, $route.port, $Method.ToUpperInvariant(), $Url, $Session.Cookies, $type, $body,
+            $script:RuTrackerUserAgent, $script:RuTrackerTimeoutMs, 4000000)
     } catch {
-        return (& $failed $_.Exception)
-    } finally {
-        if ($null -ne $response) { $response.Close() }
-        [Net.ServicePointManager]::SecurityProtocol = $tls
+        return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = (Get-RuTrackerNetError $_.Exception) }
     }
+    if ($answer.Error) { return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = [string]$answer.Error } }
+    return [pscustomobject]@{ status = [int]$answer.Status; contentType = [string]$answer.ContentType; bytes = [byte[]]$answer.Body; location = [string]$answer.Location; error = '' }
 }
 function Resolve-RuTrackerRedirect([string]$From, [string]$Location) {
     # A redirect is followed only inside https://rutracker.org/forum/ (same site, scheme and port).

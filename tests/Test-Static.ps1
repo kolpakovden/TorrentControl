@@ -58,7 +58,7 @@ foreach ($name in @('AutoLoad.ps1', 'TorrentMetadata.cs', 'TrackerMigration.ps1'
 }
 $ru = [IO.File]::ReadAllText((Join-Path $repo 'RuTracker.ps1'))
 $hosts = @([regex]::Matches([regex]::Replace($ru, '(?m)^\s*#.*$', '').Replace('\.', '.'), 'https?://[A-Za-z0-9.-]+') | ForEach-Object { $_.Value } | Select-Object -Unique)
-Assert (@($hosts | Where-Object { $_ -notin @('https://rutracker.org', 'http://bt.t-ru.org', 'https://static.rutracker.cc') }).Count -eq 0) "RuTracker.ps1 addresses: $($hosts -join ', ')"
+Assert (@($hosts | Where-Object { $_ -notin @('https://rutracker.org', 'http://bt.t-ru.org', 'https://static.rutracker.cc', 'https://ps1.blockme.site') }).Count -eq 0) "RuTracker.ps1 addresses: $($hosts -join ', ')"
 Assert ($ru -match [regex]::Escape("Join-Path `$env:LOCALAPPDATA 'TorrentControl\personal'")) 'personal torrents must live in the Windows profile'
 # Only confirmed RuTracker tracker domains count as personal; widening the list needs a real file as evidence.
 Assert ($ru -match [regex]::Escape("`$script:RuTrackerTrackerDomains = @('t-ru.org', 'rutracker.cx', 'rutracker.org')")) 'RuTracker tracker domains changed without review'
@@ -77,8 +77,9 @@ foreach ($file in $production) {
 }
 $route = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerRoute.cs'))
 Assert (([regex]::Matches($route, 'new SslStream\(')).Count -eq 1 -and $route -match [regex]::Escape('{ seen = errors; return errors == SslPolicyErrors.None; }')) 'RuTrackerRoute.cs must accept only certificates without errors'
-Assert ($route -match [regex]::Escape('"CONNECT " + host + ":443 HTTP/1.1')) 'route check does not use HTTP CONNECT'
-Assert ($ru -match [regex]::Escape('$request.AllowAutoRedirect = $false') -and $ru -match [regex]::Escape('$request.Proxy = Get-RuTrackerWebProxy') -and $ru -notmatch 'Invoke-WebRequest') 'RuTracker requests must set redirects and the proxy explicitly'
+Assert ($route -match [regex]::Escape('"CONNECT " + host + ":" + port + " HTTP/1.1') -and $route -match [regex]::Escape('stream = Authenticate(stream, proxyHost, true);')) 'the route must use HTTP CONNECT and validate an https proxy like the site'
+Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect') 'RuTrackerRoute.cs is the only transport and never follows redirects'
+Assert (([regex]::Matches($ru, [regex]::Escape('[RuTrackerRoute]::Send('))).Count -eq 1 -and $ru -notmatch 'Invoke-WebRequest|WebRequest\]::Create|HttpClient|Net\.WebProxy') 'RuTracker requests must go through RuTrackerRoute.cs only'
 Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
 $diagnostics = [IO.File]::ReadAllText((Join-Path $repo 'Test-RuTrackerConnection.ps1'))
 foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Import-Clixml', 'Invoke-RuTrackerLogin', 'Get-PersonalTorrent', 'Invoke-RuTrackerHttp', 'Start-Process', 'Stop-Process', 'Set-Content', 'Out-File')) {

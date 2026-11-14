@@ -75,12 +75,12 @@ function New-TestInfo([string]$Name = 'Film.mkv', [long]$Length = 58, [string]$S
     if ($Salt) { $pieces[0] = [byte]($Salt.Length % 251 + 1) }
     return [ordered]@{ length = $Length; name = $Name + $Salt; 'piece length' = 16384; pieces = $pieces }
 }
-function New-TestTorrentFile([string]$Path, $Info, [string]$Announce = '', $Tiers = $null) {
+function New-TestTorrentFile([string]$Path, $Info, [string]$Announce = '', $Tiers = $null, [string]$Topic = '6612345') {
     # Keys in sorted order like real files; returns the infohash.
     $top = [ordered]@{}
     if ($Announce) { $top['announce'] = $Announce }
     if ($null -ne $Tiers) { $top['announce-list'] = @(foreach ($tier in $Tiers) { ,@($tier) }) }
-    $top['comment'] = 'https://rutracker.org/forum/viewtopic.php?t=6612345'
+    $top['comment'] = 'https://rutracker.org/forum/viewtopic.php?t=' + $Topic
     $top['info'] = $Info
     [IO.File]::WriteAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($Path), (ConvertTo-TestBencode $top))
     return (Get-TestSha1 (ConvertTo-TestBencode $Info))

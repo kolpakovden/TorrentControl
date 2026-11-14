@@ -13,6 +13,9 @@ using System.Threading;
 //   connect-407     : asks for proxy authentication
 //   silent          : accepts and never answers (timeout)
 //   close           : accepts, reads the request and closes without an answer
+//   tls-garbage     : records the first bytes (a TLS ClientHello for an https proxy) and answers with non-TLS bytes
+//   respond         : plain HTTP server for the parser tests: records the request (head and body) and sends the
+//                     scripted response given to the constructor
 public sealed class FakeProxy : IDisposable {
     readonly TcpListener listener;
     readonly Thread worker;
@@ -22,8 +25,11 @@ public sealed class FakeProxy : IDisposable {
     public readonly List<string> Requests = new List<string>();
     public readonly List<byte[]> TunnelBytes = new List<byte[]>();
 
-    public FakeProxy(string mode) {
+    readonly string response;
+    public FakeProxy(string mode) : this(mode, "") { }
+    public FakeProxy(string mode, string response) {
         this.mode = mode;
+        this.response = response;
         listener = new TcpListener(IPAddress.Loopback, 0);
         listener.Start();
         Port = ((IPEndPoint)listener.LocalEndpoint).Port;
@@ -54,6 +60,17 @@ public sealed class FakeProxy : IDisposable {
     void Handle(TcpClient client) {
         NetworkStream stream = client.GetStream();
         stream.ReadTimeout = 10000;
+        if (mode == "tls-garbage") {
+            var first = new byte[4096];
+            int got = 0;
+            try { got = stream.Read(first, 0, first.Length); } catch (IOException) { }
+            var hello = new byte[got];
+            Array.Copy(first, hello, got);
+            lock (TunnelBytes) { TunnelBytes.Add(hello); }
+            Send(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\nthis is not TLS");
+            Thread.Sleep(200);
+            return;
+        }
         string head = ReadHead(stream);
         lock (Requests) { Requests.Add(head); }
         switch (mode) {
@@ -67,6 +84,19 @@ public sealed class FakeProxy : IDisposable {
                 lock (TunnelBytes) { TunnelBytes.Add(copy); }
                 Send(stream, "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\n\r\nthis is not TLS");
                 Thread.Sleep(200);
+                break;
+            }
+            case "respond": {
+                int length = 0;
+                foreach (string line in head.Split(new[] { "\r\n" }, StringSplitOptions.None))
+                    if (line.StartsWith("Content-Length:", StringComparison.OrdinalIgnoreCase)) length = int.Parse(line.Substring(15).Trim());
+                var body = new StringBuilder();
+                for (int i = 0; i < length; i++) { int b = stream.ReadByte(); if (b < 0) break; body.Append((char)b); }
+                lock (Requests) { Requests[Requests.Count - 1] = head + body.ToString(); }
+                byte[] bytes = Encoding.GetEncoding(28591).GetBytes(response);
+                stream.Write(bytes, 0, bytes.Length);
+                stream.Flush();
+                Thread.Sleep(100);
                 break;
             }
             case "connect-403": Send(stream, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); break;

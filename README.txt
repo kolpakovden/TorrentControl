@@ -13,8 +13,9 @@ TORRENTCONTROL 1.8
 9-RuTracker-login.cmd — вход (под пользователем Windows, от имени которого работает монитор).
 10-RuTracker-check.cmd — проверка получения персонального .torrent.
 Без входа новые фильмы ждут авторизации; публичная версия не добавляется.
-Если rutracker.org напрямую не открывается: Hiddify -> "Режим службы" = "Только прокси",
-затем 15-RuTracker-connection.cmd (найдёт и проверит локальный порт, запишет rutracker-proxy.txt).
+Если rutracker.org напрямую не открывается: 15-RuTracker-connection.cmd проверит маршрут официального
+расширения RuTracker (HTTPS-прокси ps1.blockme.site:443, как в Firefox) и локальный прокси Hiddify
+и после ввода YES запишет рабочий в rutracker-proxy.txt.
 Прокси используется только для запросов TorrentControl к RuTracker; настройки Windows не меняются.
 Пароль и cookie зашифрованы DPAPI; на GitHub не передаются.
 Если TorrentControl не достаёт до RuTracker, а Firefox может: скачайте персональный .torrent в Firefox и

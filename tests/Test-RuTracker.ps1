@@ -160,11 +160,12 @@ try {
     # Optional proxy for RuTracker requests only.
     Assert ((Read-RuTrackerProxy (Join-Path $temp 'nothing')) -eq '') 'proxy without a file'
     $proxyFile = Join-Path $store 'rutracker-proxy.txt'
-    foreach ($case in @(@("http://127.0.0.1:8118`r`n", 'http://127.0.0.1:8118'), @('http://proxy.lan:3128/', 'http://proxy.lan:3128'))) {
+    foreach ($case in @(@("http://127.0.0.1:8118`r`n", 'http://127.0.0.1:8118'), @('http://proxy.lan:3128/', 'http://proxy.lan:3128'),
+        @('https://ps1.blockme.site:443', 'https://ps1.blockme.site:443'), @('https://PS1.Blockme.Site', 'https://ps1.blockme.site:443'), @('http://proxy.lan', 'http://proxy.lan:80'))) {
         [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($proxyFile), $case[0])
         Assert ((Read-RuTrackerProxy $store) -eq $case[1]) "proxy not read: $($case[0])"
     }
-    foreach ($bad in @('http://user:FAKEpw@127.0.0.1:8118', 'socks5://127.0.0.1:1080', 'https://127.0.0.1:8118', 'http://127.0.0.1:8118/path', '127.0.0.1:8118', '')) {
+    foreach ($bad in @('http://user:FAKEpw@127.0.0.1:8118', 'https://user:FAKEpw@ps1.blockme.site:443', 'socks5://127.0.0.1:1080', 'ftp://127.0.0.1:21', 'http://127.0.0.1:8118/path', 'https://ps1.blockme.site/pac', '127.0.0.1:8118', '')) {
         [IO.File]::WriteAllText($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($proxyFile), $bad)
         Assert-Throws { Read-RuTrackerProxy $store } 'RuTrackerProxyInvalid' "bad proxy accepted: $bad"
     }
