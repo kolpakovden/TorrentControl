@@ -166,7 +166,8 @@ public static class TlsProbe {
             try { inner.AuthenticateAsClient(target, null, protocols, false); }
             catch (Exception e) { result.Outcome = IsTimeout(e) ? "Timeout" : "HandshakeFailed"; result.Detail = Code(e); return result; }
             result.Outcome = "HandshakeOk";
-            result.Detail = inner.SslProtocol + ", " + inner.CipherAlgorithm + "/" + inner.HashAlgorithm + ", certificate " + (inner.RemoteCertificate == null ? "?" : inner.RemoteCertificate.Subject);
+            // Only the protocol: the cipher properties are obsolete (a compile error) in newer .NET.
+            result.Detail = inner.SslProtocol + ", certificate " + (inner.RemoteCertificate == null ? "?" : inner.RemoteCertificate.Subject);
             byte[] request = Encoding.ASCII.GetBytes("HEAD /forum/index.php HTTP/1.1\r\nHost: " + target + "\r\nUser-Agent: TorrentControl-tls-probe\r\nConnection: close\r\n\r\n");
             inner.Write(request, 0, request.Length); inner.Flush();
             string line = ReadLine(inner);
@@ -192,7 +193,7 @@ public static class TlsProbe {
             var outer = new SslStream(network, false); owned.Add(outer);   // normal certificate validation of the proxy
             try { outer.AuthenticateAsClient(proxyHost); }
             catch (Exception e) { result.Outcome = "ProxyFailed"; result.Detail = "TLS to the proxy: " + Code(e); return null; }
-            result.Proxy = "TLS to proxy " + outer.SslProtocol + "/" + outer.CipherAlgorithm;
+            result.Proxy = "TLS to proxy " + outer.SslProtocol;
             stream = outer;
         }
         byte[] ask = Encoding.ASCII.GetBytes("CONNECT " + target + ":443 HTTP/1.1\r\nHost: " + target + ":443\r\nUser-Agent: TorrentControl-tls-probe\r\n\r\n");
