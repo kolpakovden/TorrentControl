@@ -20,13 +20,13 @@ Assert (!$s.demand) 'peers in the swarm (13) or seeds (14/15) must not count as 
 $old = Old-Record $h1 (40*$day) (20*$day)
 $s = Update-History (New-TestRow $h1 $path -PeersSwarm 120 -SeedsSwarm 40) $path $old $now
 Assert (!$s.demand) 'swarm-only peers counted as demand'
-Assert ((Get-Decision $s $now) -eq 'Кандидат на удаление') 'swarm-only torrent must still become a candidate'
+Assert ($s.running -and $s.knownPeers -and $s.complete -and $s.uploadSince -eq $now) 'swarm-only torrent is a plain idle seed with upload history'
 Assert ($s.quietSince -eq $old.quietSince) 'quiet period must continue without own demand'
 
 # --- Real observed demand ------------------------------------------------------------------------
 $s = Update-History (New-TestRow $h1 $path -PeersConnected 2) $path $old $now
 Assert ($s.demand -and $s.demandReason -eq 'ConnectedPeers' -and $s.quietSince -eq $now) 'connected peers (12) are demand'
-Assert ((Get-Decision $s $now) -eq 'Есть спрос') 'connected peers decision'
+Assert ((Get-DemandLabel $s) -eq 'подключены пиры') 'connected peers label'
 $s = Update-History (New-TestRow $h1 $path -UpSpeed 4096) $path $old $now
 Assert ($s.demand -and $s.demandReason -eq 'UploadSpeed') 'upload speed (8) is demand'
 $s = Update-History (New-TestRow $h1 $path -Uploaded 5MB) $path (Old-Record $h1 (40*$day) (20*$day) 1MB) $now
@@ -39,10 +39,10 @@ Assert ($s.demandReason -eq 'Upload,UploadSpeed,ConnectedPeers') 'all demand rea
 $r = New-TestRow $h1 $path; $r[12] = $null
 $s = Update-History $r $path $old $now
 Assert (!$s.knownPeers -and $s.quietSince -eq $now) 'unknown connected peers must not look like no demand'
-Assert ((Get-Decision $s $now) -eq 'Недостаточно данных / остановлена') 'unknown peers decision'
+Assert ($s.uploadSince -eq 0 -and $s.uploadNote -eq 'NotSeeding') 'unknown peers stop the upload history'
 $r = New-TestRow $h1 $path; $r[13] = $null; $r[15] = -1
 $s = Update-History $r $path $old $now
-Assert ($s.knownPeers -and (Get-Decision $s $now) -eq 'Кандидат на удаление') 'swarm counts are irrelevant even when missing'
+Assert ($s.knownPeers -and $s.uploadSince -eq $now) 'swarm counts are irrelevant even when missing'
 foreach ($status in @(200, 233, 152, 130)) {
     # 200 queued seed (not started), 233 paused, 152 error, 130 checking
     $s = Update-History (New-TestRow $h1 $path -Status $status) $path $old $now

@@ -24,3 +24,6 @@ metadata-probe/
 tests/autoload-test-*/
 __pycache__/
 *.bak
+cleanup.html
+cleanup.csv
+cleanup.json

@@ -5,7 +5,9 @@ $root = $PSScriptRoot
 . "$root\LocalPaths.ps1"
 . "$root\Feed.ps1"
 . "$root\AutoLoad.ps1"
-function Save-Json($Value, $Path) { Save-AutoJson $Value $Path }
+. "$root\Cleanup.ps1"
+# Compact JSON: state.json holds the hourly upload history of every torrent on D:/F:.
+function Save-Json($Value, $Path) { Save-AutoJson $Value $Path -Compress }
 function Get-MonitorErrorCode($Exception) {
     # Fixed codes only; never log response bodies, tokens or URLs.
     $allowed = @('EmptyTorrentList','UnsupportedRowFormat','StateUnreadable','StateMissingBackupPresent','TokenMissing','TorrentListMissing')
@@ -84,13 +86,20 @@ function Collect {
             Add-Content "$root\monitor.log" "$(Get-Date -Format s) AUTO ERROR: $($_.Exception.GetType().Name); $(Get-AutoErrorCode $_.Exception)" -Encoding UTF8
         }
     }
-    $now = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds()
+    $now = Get-UnixNow
     $merge = Merge-History $torrents $localPaths $previousItems $now
+    # Cleanup is Dry Run only: decisions are reported, nothing is deleted, stopped or changed.
+    $cleanupMode = Get-CleanupMode $root
+    $owned = Get-CleanupOwnership $root
+    $observed = @($merge.observed)
+    $decisions = @(foreach ($entry in $observed) { Get-CleanupDecision $entry $now $listProblem $owned })
+    # History first: if it cannot be saved, no report shows decisions the next run could not reproduce.
+    Save-Json @{ version = 1; updated = $now; items = @($merge.items) } $statePath
     $report = @()
-    foreach ($entry in $merge.observed) {
-        $row = $entry.row; $state = $entry.state
+    for ($i = 0; $i -lt $observed.Count; $i++) {
+        $entry = $observed[$i]; $row = $entry.row; $state = $entry.state
         $report += [pscustomobject]@{
-            Решение = (Get-Decision $state $now); Признак_спроса = (Get-DemandLabel $state)
+            Решение = $decisions[$i].decision; Причина = $decisions[$i].reason; Признак_спроса = (Get-DemandLabel $state)
             Название = [string]$row[2]; Путь = $entry.path
             ГБ = (Format-RowNumber $row[3] 1GB 2)
             Готово = (Format-RowNumber $row[4] 10 1)
@@ -104,9 +113,14 @@ function Collect {
     }
     $report = @($report | Sort-Object Решение, Название)
     $stamp = Get-Date -Format 'yyyy-MM-dd HH:mm:ss'
-    $observedCount = @($merge.observed).Count
-    $intro = "<h1>Монитор временных раздач</h1><p>Обновлено: $stamp · Мониторинг раздач; удаление отключено.</p><p>Раздач D/F: $observedCount. Другие диски: $($merge.excluded). Путь не определён: $($merge.unknown). Некорректные данные клиента: $($merge.invalid).</p>"
-    $intro += '<p>Кандидат: 30 дней наблюдаемого хранения и 14 дней без замеченного спроса. Спросом считается только то, что видит наш клиент: прирост отдачи с прошлой проверки, текущая скорость отдачи или подключённые к нам пиры (не сиды). Перерыв в проверках более часа, остановка или ошибка сбрасывают период тишины.</p>'
+    $observedCount = $observed.Count
+    $notes = @()
+    if ($cleanupMode.warning) { $notes += $cleanupMode.warning }
+    if ($merge.unknown -gt 0) { $notes += "Путь не определён у $($merge.unknown) раздач: они не оцениваются." }
+    $cleanup = Write-CleanupReport $decisions $root $cleanupMode.mode $now $merge.excluded $notes
+    $cleanupGib = [math]::Round($cleanup.bytes / 1GB, 2)
+    $intro = "<h1>Монитор временных раздач</h1><p style='font-weight:bold;color:#8a1c1c'>$($script:CleanupBanner)</p><p>Обновлено: $stamp. Раздач D/F: $observedCount. Другие диски: $($merge.excluded). Путь не определён: $($merge.unknown). Некорректные данные клиента: $($merge.invalid).</p>"
+    $intro += "<p>Очистка ($($cleanupMode.mode)): кандидатов $($cleanup.candidates), потенциально освобождается $cleanupGib ГиБ — <a href='cleanup.html'>отчёт об очистке</a>. Кандидат: полностью скачана, наблюдается не менее 30 дней, в каждые из трёх последних суток отдано менее 1 ГиБ, сейчас нет отдачи и подключённых скачивающих пиров. «Признак_спроса» и «Дней_без_спроса» показаны справочно.</p>"
     $intro += '<p>Столбцы «Пиров_в_рое» и «Сидов_в_рое» — сведения о рое в целом (по данным трекера), а не о нашей раздаче; на решение они не влияют. «н/д» — клиент не сообщил корректное значение.</p>'
     if ($merge.kept -gt 0 -or $merge.missing -gt 0) {
         $intro += "<p>История сохранена без обновления: $($merge.kept) (путь временно не определён, данные некорректны или отсутствие раздачи не подтверждено). Нет в списке клиента: $($merge.missing) — история удаляется только после трёх подряд проверок без раздачи и не ранее чем через 6 часов.</p>"
@@ -122,8 +136,9 @@ function Collect {
     $html = $report | ConvertTo-Html -Head $style -PreContent $intro
     $html | Set-Content "$root\report.html" -Encoding UTF8
     $report | Export-Csv "$root\report.csv" -NoTypeInformation -Encoding UTF8 -Delimiter ';'
-    Save-Json @{ version = 1; updated = $now; items = @($merge.items) } $statePath
     Add-Content "$root\monitor.log" "$stamp OK: D/F=$observedCount, unknown=$($merge.unknown), excluded=$($merge.excluded), invalid=$($merge.invalid), kept=$($merge.kept), missing=$($merge.missing), removed=$($merge.removed)" -Encoding UTF8
+    if ($cleanupMode.mode -eq 'Disabled') { Add-Content "$root\monitor.log" "$stamp CLEANUP DISABLED" -Encoding UTF8 }
+    else { Add-Content "$root\monitor.log" "$stamp CLEANUP DRY RUN: candidates=$($cleanup.candidates), GiB=$cleanupGib, insufficient=$($cleanup.insufficient), keep=$($cleanup.keep)" -Encoding UTF8 }
     Write-Host "OK: $observedCount torrents on D/F. Report: $root\report.html"
 }
 # Dot-sourcing (tests) only defines the functions above.
