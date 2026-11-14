@@ -38,13 +38,17 @@ public sealed class FakeProxy : IDisposable {
         worker.Start();
     }
 
-    // A port on which nothing listens (refused connections).
+    // A port on which nothing listens (refused connections). The port stays bound, without listening, for the whole
+    // test process: a fake server started later can never be given the same port by the system.
+    static Socket reserved;
     public static int ClosedPort() {
-        var probe = new TcpListener(IPAddress.Loopback, 0);
-        probe.Start();
-        int port = ((IPEndPoint)probe.LocalEndpoint).Port;
-        probe.Stop();
-        return port;
+        lock (typeof(FakeProxy)) {
+            if (reserved == null) {
+                reserved = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp);
+                reserved.Bind(new IPEndPoint(IPAddress.Loopback, 0));
+            }
+            return ((IPEndPoint)reserved.LocalEndPoint).Port;
+        }
     }
 
     public string AllRequests() { lock (Requests) { return string.Join("\n----\n", Requests.ToArray()); } }
