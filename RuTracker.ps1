@@ -235,11 +235,12 @@ function Initialize-RuTrackerNet {
 }
 function Get-RuTrackerTimeout([int]$TimeoutMs) {
     # Timeout for the next request inside the budget of the current Get-PersonalTorrent call; 0 = budget spent.
-    # One request can take about three timeouts (up to 3 proxy addresses), hence a third of what is left.
+    # RuTrackerRoute.cs ends any request after 3 timeouts at the latest, so a third of what is left keeps every
+    # request inside the budget.
     if ($null -eq $script:RuTrackerDeadline) { return $TimeoutMs }
     $left = ($script:RuTrackerDeadline - [DateTime]::UtcNow).TotalMilliseconds
-    if ($left -lt 5000) { return 0 }
-    return [int][math]::Min($TimeoutMs, [math]::Max(3000, $left / 3))
+    if ($left -lt 9000) { return 0 }   # less than 3 timeouts of 3 s
+    return [int][math]::Min($TimeoutMs, [math]::Floor($left / 3))
 }
 function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
     # Anonymous: TCP, TLS to an https proxy, CONNECT, TLS with normal certificate validation, status of
@@ -316,9 +317,11 @@ function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$
     # never carried to another address. Certificates are validated as usual; on any network or TLS failure only a
     # fixed code is returned, never an exception text. Replaced by stubs in most tests.
     if ($Url -notmatch '^https://(rutracker\.org/forum/|static\.rutracker\.cc/captcha/)') { throw 'RuTrackerRedirectRefused' }
-    $timeout = Get-RuTrackerTimeout $script:RuTrackerTimeoutMs
-    if ($timeout -le 0) { return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
+    $spent = [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' }
+    if ((Get-RuTrackerTimeout $script:RuTrackerTimeoutMs) -le 0) { return $spent }
     Initialize-RuTrackerNet
+    $timeout = Get-RuTrackerTimeout $script:RuTrackerTimeoutMs   # after the first compilation of the transport
+    if ($timeout -le 0) { return $spent }
     $route = Get-RuTrackerRouteParts $script:RuTrackerProxy
     $body = $null; $type = ''
     if ($Form) { $body = [Text.Encoding]::ASCII.GetBytes($Form); $type = 'application/x-www-form-urlencoded' }
@@ -455,6 +458,8 @@ function Get-PersonalTorrent([string]$Directory, [string]$Topic, [string]$Hash) 
     if ($null -eq $credential) { throw 'RuTrackerNotConfigured' }
     # Time budget for the scheduled task (see RuTrackerBudgetSeconds); interactive scripts get the same limit.
     $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds($script:RuTrackerBudgetSeconds)
+    # Within a monitor run, also the run limit (AutoLoad.ps1, AutoRunDeadline), whichever comes first.
+    if ($null -ne $script:AutoRunDeadline -and $script:AutoRunDeadline -lt $script:RuTrackerDeadline) { $script:RuTrackerDeadline = $script:AutoRunDeadline }
     try {
         # No cookie or password leaves this computer before the route works anonymously with a valid certificate.
         Assert-RuTrackerRoute

@@ -6,6 +6,23 @@
     if ([IO.File]::Exists($full)) {[IO.File]::Replace("$full.tmp",$full,"$full.bak")}
     else {[IO.File]::Move("$full.tmp",$full)}
 }
+# Time limit of one monitor run. The scheduled task TorrentMonitor-DF stops a run after 5 minutes (Monitor.ps1 -Setup,
+# ExecutionTimeLimit). Monitor.ps1 sets AutoRunDeadline for a normal run: autoload starts no step that can wait on the
+# network (GitHub, WebUI, RuTracker) after it, so the last AutoRunReserveSeconds stay for handing a torrent to uTorrent
+# and saving auto-state.json, state.json and the reports. Not set (tests, interactive tools): no run limit.
+$script:AutoRunLimitSeconds=300
+$script:AutoRunReserveSeconds=60
+$script:AutoItemSeconds=90          # one record before RuTracker: GitHub metadata (25 s) and the WebUI list (2 x 30 s)
+$script:AutoRuTrackerMinSeconds=30  # the least time the RuTracker steps of a record are started with
+$script:AutoRunDeadline=$null
+function Get-AutoRunDeadline {
+    $started=[Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()
+    return $started.AddSeconds($script:AutoRunLimitSeconds-$script:AutoRunReserveSeconds)
+}
+function Test-AutoTimeLeft([int]$Seconds) {
+    if ($null -eq $script:AutoRunDeadline) {return $true}
+    return ([DateTime]::UtcNow.AddSeconds($Seconds) -le $script:AutoRunDeadline)
+}
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
@@ -169,6 +186,7 @@ function Write-AutoReport($State,[string]$Directory) {
         PersonalTrackersUnexpected='В полученном .torrent кроме персонального адреса есть публичный или посторонний трекер; файл не добавляется, нужна проверка.'
         PersonalTorrentInvalid='Полученный .torrent повреждён; повтор при следующем опросе.'
         TopicHashChanged='Раздача в теме перезалита: хеш не совпадает с лентой. Старая версия не добавляется.'
+        RunTimeLimit='Опрос не успел бы закончиться за 5 минут (лимит задания); продолжение на следующем опросе.'
     }
     $rows=@($State.items | ForEach-Object {
         $reason=[string]$_.reason
@@ -235,6 +253,8 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
         if (!@($Rows).Count) {return 'Автозагрузка ждёт: µTorrent вернул пустой список раздач.'}
         $examined=0
         foreach($item in @($state.items | Where-Object {$_.status -in @('WaitingMetadata','NoSpace','WaitingAuth')} | Sort-Object lastAttempt)) {
+            # A record is started only if its network steps can end before the run limit (AutoRunDeadline).
+            if (!(Test-AutoTimeLeft $script:AutoItemSeconds)) {return 'Автозагрузка продолжится на следующем опросе: время одного опроса ограничено 5 минутами.'}
             if (++$examined -gt 3) {break}
             $item.lastAttempt=[DateTimeOffset]::UtcNow.ToString('o')
             $presence=Get-AutoPresence $Rows $Paths $item.hash
@@ -273,6 +293,7 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
             # The personal .torrent from the user's own RuTracker session (RuTracker.ps1): same infohash as the feed,
             # personal announce. Without it nothing is added - never the public magnet version.
             $personal=$null
+            if (!(Test-AutoTimeLeft $script:AutoRuTrackerMinSeconds)) {$item.reason='RunTimeLimit';return 'Автозагрузка продолжится на следующем опросе: время одного опроса ограничено 5 минутами.'}
             try {$personal=Get-PersonalTorrent $Directory $item.topic $item.hash}
             catch {
                 $code=Get-AutoErrorCode $_.Exception

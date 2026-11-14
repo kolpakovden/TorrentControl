@@ -88,6 +88,14 @@ Assert ($retry -and $retry -notmatch 'TlsCertificateInvalid|ProxyAuthRequired|Ht
 foreach ($file in $production) { Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'TestAddresses' -or $file.Name -eq 'RuTrackerRoute.cs') "$($file.Name) sets test proxy addresses" }
 Assert ($route -match [regex]::Escape('if (name.EndsWith(".test", StringComparison.OrdinalIgnoreCase)) {')) 'test addresses must stay limited to the reserved .test domain'
 Assert ($route -match [regex]::Escape('WaitOne(Math.Min(timeoutMs, MaxConnectMs))') -and $ru -match '(?s)function Get-PersonalTorrent\(.*?\$script:RuTrackerDeadline = \[DateTime\]::UtcNow\.AddSeconds\(\$script:RuTrackerBudgetSeconds\).*?finally \{ \$script:RuTrackerDeadline = \$null \}') 'RuTracker requests must stay inside the 5-minute limit of the scheduled task'
+# One monitor run stays inside the 5-minute limit of the scheduled task (Monitor.ps1 -Setup registers it).
+$monitor = [IO.File]::ReadAllText((Join-Path $repo 'Monitor.ps1'))
+$autoText = [IO.File]::ReadAllText((Join-Path $repo 'AutoLoad.ps1'))
+Assert ($monitor -match [regex]::Escape('-ExecutionTimeLimit (New-TimeSpan -Minutes 5)') -and $autoText -match [regex]::Escape('$script:AutoRunLimitSeconds=300')) 'run limit and task limit differ'
+Assert ($monitor -match '(?s)\} else \{.*?\$script:AutoRunDeadline = Get-AutoRunDeadline\s+Collect') 'a scheduled run must set the run limit before Collect'
+Assert ($autoText -match '(?s)Test-AutoTimeLeft \$script:AutoItemSeconds.*?Test-AutoTimeLeft \$script:AutoRuTrackerMinSeconds.*?Get-PersonalTorrent') 'autoload must check the time left before a record and before RuTracker'
+Assert ($ru -match [regex]::Escape('if ($null -ne $script:AutoRunDeadline -and $script:AutoRunDeadline -lt $script:RuTrackerDeadline) { $script:RuTrackerDeadline = $script:AutoRunDeadline }')) 'RuTracker must respect the run limit'
+Assert ($route -match [regex]::Escape('guard = new Timer(Expire, null, 3L * timeoutMs, System.Threading.Timeout.Infinite);') -and $route -match [regex]::Escape('if (expired) return "Timeout";')) 'a request must end after 3 timeouts at the latest'
 Assert ($ru -match [regex]::Escape('$script:RuTrackerBudgetSeconds = 120') -and ([regex]::Matches($ru, 'Get-RuTrackerTimeout ')).Count -ge 2) 'time budget not applied to every request'
 Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('const int MaxProxyAttempts = 3;')) 'failover attempt must end before the request'
 Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect') 'RuTrackerRoute.cs is the only transport and never follows redirects'
@@ -116,6 +124,15 @@ Assert ($loader -match [regex]::Escape('if ($hash -ne $entry.sha256) { throw ''T
 $libFiles = @(Get-ChildItem -LiteralPath (Join-Path $repo 'lib') -Recurse -File | ForEach-Object { $_.FullName.Substring($repo.Length + 1).Replace('\', '/') } | Sort-Object)
 Assert (($libFiles -join ',') -eq 'lib/bouncycastle/2.7.0/LICENSE.md,lib/bouncycastle/2.7.0/net461/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/net6.0/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/SOURCE.txt') "unexpected files in lib: $($libFiles -join ', ')"
 
+# --- README: every PowerShell command block parses (the deployment blocks also run in Test-Deployment.ps1) ------
+$readmeText = [IO.File]::ReadAllText((Join-Path $repo 'README.md'))
+$blocks = @([regex]::Matches($readmeText, '(?s)```powershell\r?\n(.*?)\r?\n```'))
+Assert ($blocks.Count -ge 5) "README PowerShell blocks: $($blocks.Count)"
+foreach ($block in $blocks) {
+    $tokens = $null; $errors = $null
+    $null = [Management.Automation.Language.Parser]::ParseInput($block.Groups[1].Value, [ref]$tokens, [ref]$errors)
+    Assert (@($errors).Count -eq 0) "README command block does not parse: $(@($errors | ForEach-Object { $_.Message }) -join '; ')"
+}
 # --- Import of personal .torrent files and the Dry Run: offline, read-only for uTorrent and C:\TorrentMonitor -----
 foreach ($name in @('PersonalImport.ps1', 'Import-PersonalTorrent.ps1', 'Test-PersonalMigration.ps1')) {
     $text = [regex]::Replace([IO.File]::ReadAllText((Join-Path $repo $name)), '(?m)^\s*#.*$', '')

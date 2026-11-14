@@ -46,6 +46,12 @@ try {
     $silent = New-FakeProxy 'silent'
     $r = [RuTrackerRoute]::Check('127.0.0.1', $silent.Port, 'rutracker.org', '/forum/index.php', 1500)
     Assert ($r.Code -eq 'Timeout' -and $r.Stage -eq 'ProxyTunnel' -and $r.ElapsedMs -lt 8000) "silent proxy: $($r.Code)/$($r.Stage)/$($r.ElapsedMs)"
+    # A server that keeps answering slowly never times out a single read: the whole request still ends after
+    # 3 timeouts (hard limit of RuTrackerRoute.cs), which the time budget of RuTracker.ps1 relies on.
+    $r = [RuTrackerRoute]::Check('127.0.0.1', (New-FakeProxy 'trickle').Port, 'rutracker.org', '/forum/index.php', 1000)
+    Assert ($r.Code -eq 'Timeout' -and $r.ElapsedMs -ge 2500 -and $r.ElapsedMs -lt 6000) "slow answer not cut: $($r.Code)/$($r.ElapsedMs)"
+    $send = [RuTrackerRoute]::Send('http', '127.0.0.1', (New-FakeProxy 'trickle').Port, 'GET', 'https://rutracker.org/forum/dl.php?t=1', (New-Object Net.CookieContainer), '', $null, 'TorrentControl-test', 1000, 4000000)
+    Assert ($send.Status -eq 0 -and $send.Error -eq 'Timeout') "slow answer not cut for a request: $($send.Error)"
     $closed = [FakeProxy]::ClosedPort()
     # Windows needs about 2 s to report a refused local connection: allow for it.
     $r = [RuTrackerRoute]::Check('127.0.0.1', $closed, 'rutracker.org', '/forum/index.php', 8000)

@@ -7,6 +7,7 @@ using System.Net.Security;
 using System.Net.Sockets;
 using System.Security.Authentication;
 using System.Text;
+using System.Threading;
 
 // The only network transport of TorrentControl to RuTracker (RuTracker.ps1, Test-RuTrackerConnection.ps1).
 // Compiled together with RuTrackerTls13.cs by RuTrackerTls13.ps1 (Initialize-RuTrackerTransport).
@@ -24,7 +25,8 @@ using System.Text;
 // The proxy sees "host:443" only; paths, cookies and passwords travel inside the TLS session with the host.
 // A proxy name with several addresses: up to 3 are tried in turn, each attempt ends before any byte of the request
 // is sent, and none follows a rejected certificate or a proxy password request. One request per connection,
-// redirects are never followed here, sizes and times are bounded. Nothing is changed in Windows, DNS, routes or proxy
+// redirects are never followed here, sizes are bounded, and a request (all addresses, handshakes and the answer)
+// never runs longer than 3 timeouts: then its sockets are closed and it ends with Timeout. Nothing is changed in Windows, DNS, routes or proxy
 // settings.
 public sealed class RuTrackerRouteResult {
     public bool Ok;
@@ -193,6 +195,10 @@ public static class RuTrackerRoute {
         readonly int timeoutMs;
         readonly Stopwatch watch = Stopwatch.StartNew();
         readonly List<IDisposable> owned = new List<IDisposable>();
+        readonly object gate = new object();
+        readonly List<TcpClient> sockets = new List<TcpClient>();
+        readonly Timer guard;
+        volatile bool expired;
         bool proxyCertificateRejected;
         public string Stage = "";
         public int ProxyStatus;
@@ -201,7 +207,19 @@ public static class RuTrackerRoute {
         public int Attempts;
         public string Endpoint = "";
         public string TlsVersion = "";
-        public Connection(int timeoutMs) { this.timeoutMs = timeoutMs; }
+        public Connection(int timeoutMs) {
+            this.timeoutMs = timeoutMs;
+            // Hard limit of the whole request: per-read timeouts alone do not stop a server that keeps answering
+            // slowly. The caller's time budget (RuTracker.ps1) relies on this bound.
+            guard = new Timer(Expire, null, 3L * timeoutMs, System.Threading.Timeout.Infinite);
+        }
+
+        void Expire(object unused) {
+            lock (gate) {
+                expired = true;
+                foreach (TcpClient socket in sockets) { try { socket.Close(); } catch { } }
+            }
+        }
 
         public Stream Open(string proxyScheme, string proxyHost, int proxyPort, string host, int port, string agent) {
             if (string.IsNullOrEmpty(proxyScheme)) {
@@ -227,6 +245,7 @@ public static class RuTrackerRoute {
             Addresses = proxies.Length;
             if (proxies.Length == 0) throw new RuTrackerRouteFailure("ProxyUnreachable");
             for (int i = 0; ; i++) {
+                if (expired) throw new RuTrackerRouteFailure("Timeout");
                 Attempts = i + 1;
                 try {
                     Stream stream = ThroughProxy(proxyScheme == "https", proxyHost, proxies[i], proxyPort, host, port, agent);
@@ -234,7 +253,7 @@ public static class RuTrackerRoute {
                     return stream;
                 } catch (Exception e) {
                     string code = Classify(e);
-                    bool last = i + 1 >= proxies.Length || i + 1 >= MaxProxyAttempts || watch.ElapsedMilliseconds > 2L * timeoutMs;
+                    bool last = expired || i + 1 >= proxies.Length || i + 1 >= MaxProxyAttempts || watch.ElapsedMilliseconds > 2L * timeoutMs;
                     if (last || !MayTryAnotherAddress(code)) throw new RuTrackerRouteFailure(code);
                     Release();
                 }
@@ -355,6 +374,10 @@ public static class RuTrackerRoute {
                 IAsyncResult connect = candidate.BeginConnect(address, port, null, null);
                 if (!connect.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, MaxConnectMs))) { candidate.Close(); return "Timeout"; }
                 candidate.EndConnect(connect);
+                lock (gate) {
+                    if (expired) { candidate.Close(); return "Timeout"; }
+                    sockets.Add(candidate);
+                }
                 owned.Add(candidate);
                 client = candidate;
                 return "";
@@ -374,6 +397,7 @@ public static class RuTrackerRoute {
         }
 
         public string Classify(Exception e) {
+            if (expired) return "Timeout";   // the guard closed the sockets: whatever broke after that is the time limit
             var failure = e as RuTrackerRouteFailure;
             if (failure != null) return failure.Code;
             if (IsTimeout(e)) return "Timeout";
@@ -392,9 +416,10 @@ public static class RuTrackerRoute {
         void Release() {
             for (int i = owned.Count - 1; i >= 0; i--) { try { owned[i].Dispose(); } catch { } }
             owned.Clear();
+            lock (gate) { sockets.Clear(); }
         }
 
-        public void Dispose() { Release(); }
+        public void Dispose() { guard.Dispose(); Release(); }
     }
 
     static void Send(Stream stream, string text) {

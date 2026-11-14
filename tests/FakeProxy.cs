@@ -12,6 +12,7 @@ using System.Threading;
 //   connect-403     : refuses the tunnel with 403
 //   connect-407     : asks for proxy authentication
 //   silent          : accepts and never answers (timeout)
+//   trickle         : answers the CONNECT one byte every 500 ms (no read ever times out, the answer never ends soon)
 //   close           : accepts, reads the request and closes without an answer
 //   tls-garbage     : records the first bytes (a TLS ClientHello for an https proxy) and answers with non-TLS bytes
 //   respond         : plain HTTP server for the parser tests: records the request (head and body) and sends the
@@ -106,6 +107,14 @@ public sealed class FakeProxy : IDisposable {
             case "connect-403": Send(stream, "HTTP/1.1 403 Forbidden\r\nContent-Length: 0\r\n\r\n"); break;
             case "connect-407": Send(stream, "HTTP/1.1 407 Proxy Authentication Required\r\nProxy-Authenticate: Basic realm=\"x\"\r\nContent-Length: 0\r\n\r\n"); break;
             case "silent": for (int i = 0; i < 150 && !stopping; i++) Thread.Sleep(100); break;
+            case "trickle": {
+                byte[] answer = Encoding.ASCII.GetBytes("HTTP/1.1 200 Connection established\r\n\r\n");
+                for (int i = 0; i < answer.Length && !stopping; i++) {
+                    try { stream.WriteByte(answer[i]); stream.Flush(); } catch (IOException) { return; } catch (ObjectDisposedException) { return; }
+                    Thread.Sleep(500);
+                }
+                break;
+            }
             default: break;
         }
     }

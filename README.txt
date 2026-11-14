@@ -1,7 +1,8 @@
 TORRENTCONTROL 1.8
 
 ОБНОВЛЕНИЕ
-Замените исходные файлы в C:\TorrentMonitor (вместе с папкой lib).
+Замените исходные файлы в C:\TorrentMonitor (вместе с папкой lib) — порядок и откат в README.md.
+При откате на 1.8 автозагрузка выключается: 1.8 добавляла бы фильмы с публичным трекером.
 Сохраните config.json, credential.xml, state.json, feed-state.json,
 а также autoload.json, auto-state.json и файлы *.json.bak, если они уже существуют.
 1-Setup.cmd и 6-Enable-autoload.cmd при обновлении с 1.7 повторно запускать не нужно.

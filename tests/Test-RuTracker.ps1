@@ -275,9 +275,16 @@ try {
     $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(60)
     $t = Get-RuTrackerTimeout 30000
     Assert ($t -gt 19000 -and $t -le 20000 -and (Get-RuTrackerTimeout 15000) -eq 15000) "timeout inside the budget: $t"
-    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(4)
-    Assert ((Get-RuTrackerTimeout 30000) -eq 0) 'request allowed after the budget'
+    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(8)
+    Assert ((Get-RuTrackerTimeout 30000) -eq 0) 'request allowed with less than 3 short timeouts left'
     $script:RuTrackerDeadline = $null
+    # Inside a monitor run the run limit (AutoRunDeadline) wins when it comes first.
+    Clear-Personal
+    $script:AutoRunDeadline = [DateTime]::UtcNow.AddSeconds(50)
+    $null = Get-PersonalTorrent $dir $topic $siteHash
+    $ahead = ($script:deadlineSeen - [DateTime]::UtcNow).TotalSeconds
+    $script:AutoRunDeadline = $null
+    Assert ($ahead -gt 30 -and $ahead -le 50 -and $null -eq $script:RuTrackerDeadline) "run limit not applied to RuTracker: $ahead"
     # A stored verified file is used without any request (the same file was just downloaded and stored).
     $script:http.Clear(); $calls = $script:routeCalls
     $again = Get-PersonalTorrent $dir $topic $siteHash

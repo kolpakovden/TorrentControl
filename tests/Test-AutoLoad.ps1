@@ -419,6 +419,24 @@ try {
     $script:personalMode = 'nothing'
     $null = Run-Auto $new
     Assert ((Get-AutoItem).status -eq 'WaitingAuth' -and (Get-AutoItem).reason -eq 'PersonalTorrentInvalid' -and $script:launches.Count -eq $before -and !$script:fakeD.ContainsKey('D:\Фильмы\rt-900000002')) 'launched without a personal file'
+    # Run limit of the scheduled task (5 minutes): a record is not started when its network steps could still run
+    # at the limit, and RuTracker is not started with too little time left. The record continues on the next run.
+    $span = ((Get-AutoRunDeadline) - [Diagnostics.Process]::GetCurrentProcess().StartTime.ToUniversalTime()).TotalSeconds
+    Assert ([math]::Round($span) -eq 240) "run deadline is not 5 minutes minus the reserve: $span"
+    Reset-AutoState
+    $script:personalMode = 'ok'; $calls = $script:personalCalls
+    $script:AutoRunDeadline = [DateTime]::UtcNow.AddSeconds(30)
+    $message = Run-Auto $new
+    Assert ($message -match 'ограничено 5 минутами' -and (Get-AutoItem).status -eq 'WaitingMetadata' -and $script:personalCalls -eq $calls -and $script:launches.Count -eq $before) 'record started too close to the run limit'
+    $script:AutoItemSeconds = 0
+    $script:AutoRunDeadline = [DateTime]::UtcNow.AddSeconds(10)
+    $message = Run-Auto $new
+    Assert ((Get-AutoItem).reason -eq 'RunTimeLimit' -and $script:personalCalls -eq $calls -and $script:launches.Count -eq $before -and !$script:fakeD.ContainsKey('D:\Фильмы\rt-900000002')) 'RuTracker started too close to the run limit'
+    Assert ((Get-FileText (Join-Path $temp 'auto-downloads.html')) -match 'лимит задания') 'run limit not explained'
+    $script:AutoItemSeconds = 90; $script:AutoRunDeadline = $null
+    Reset-AutoState
+    $script:personalMode = 'RuTrackerProxyUnavailable'
+    $null = Run-Auto $new
     # Login fixed: the waiting record is added once, never twice.
     $script:personalMode = 'ok'
     $null = Run-Auto $new
