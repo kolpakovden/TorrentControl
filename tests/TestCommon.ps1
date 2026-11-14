@@ -66,6 +66,10 @@ function Write-TestBencode($Stream, $Value) {
     throw 'Unsupported bencode value'
 }
 function ConvertTo-TestBencode($Value) { $ms = New-Object IO.MemoryStream; Write-TestBencode $ms $Value; return ,$ms.ToArray() }
+function Get-TestSha256([byte[]]$Bytes) {
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '') } finally { $sha.Dispose() }
+}
 function Get-TestSha1([byte[]]$Bytes) {
     $sha = [Security.Cryptography.SHA1]::Create()
     try { return ([BitConverter]::ToString($sha.ComputeHash($Bytes)) -replace '-', '') } finally { $sha.Dispose() }

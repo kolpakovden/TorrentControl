@@ -86,6 +86,18 @@ foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 
     Assert ($diagnostics -notmatch $pattern) "Test-RuTrackerConnection.ps1 must stay anonymous and read-only: '$pattern'"
 }
 
+# --- TLS 1.3 component: strict certificate validation, library loaded only from verified bytes ---------------
+$tls13 = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerTls13.cs'))
+foreach ($required in @('if (!x509.Build(leaf))', 'x509.ChainPolicy.VerificationFlags = X509VerificationFlags.NoFlag;', 'ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"))',
+    'throw new TlsFatalAlert(AlertDescription.bad_certificate);', 'if (!NameInCertificate(leafBytes, owner.ExpectedName))', 'CertificateCheck.Validate(serverCertificate == null ? null : serverCertificate.Certificate, owner)')) {
+    Assert ($tls13.Contains($required)) "RuTrackerTls13.cs lost a validation step: $required"
+}
+Assert ($tls13 -notmatch 'AllowUnknownCertificateAuthority|IgnoreInvalidName|IgnoreNotTimeValid|IgnoreWrongUsage|X509VerificationFlags\.All|AllFlags|CustomTrustStore|TrustMode|ChainPolicy\.CustomTrust') 'RuTrackerTls13.cs relaxes certificate validation'
+$loader = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerTls13.ps1'))
+Assert ($loader -match [regex]::Escape('if ($hash -ne $entry.sha256) { throw ''TlsLibraryInvalid'' }') -and $loader -match [regex]::Escape('[Reflection.Assembly]::Load($bytes)') -and $loader -notmatch 'LoadFrom|LoadFile|UnsafeLoadFrom|Unblock-File') 'the TLS library must be loaded only from SHA-256-verified bytes'
+$libFiles = @(Get-ChildItem -LiteralPath (Join-Path $repo 'lib') -Recurse -File | ForEach-Object { $_.FullName.Substring($repo.Length + 1).Replace('\', '/') } | Sort-Object)
+Assert (($libFiles -join ',') -eq 'lib/bouncycastle/2.7.0/LICENSE.md,lib/bouncycastle/2.7.0/net461/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/net6.0/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/SOURCE.txt') "unexpected files in lib: $($libFiles -join ', ')"
+
 # --- Import of personal .torrent files and the Dry Run: offline, read-only for uTorrent and C:\TorrentMonitor -----
 foreach ($name in @('PersonalImport.ps1', 'Import-PersonalTorrent.ps1', 'Test-PersonalMigration.ps1')) {
     $text = [regex]::Replace([IO.File]::ReadAllText((Join-Path $repo $name)), '(?m)^\s*#.*$', '')

@@ -1,0 +1,17 @@
+BouncyCastle.Cryptography 2.7.0 (MIT license, see LICENSE.md), used only for TLS 1.3 to rutracker.org on Windows 10,
+whose Schannel has no TLS 1.3 client. Nothing is installed: TorrentControl reads the DLL, checks its SHA-256 and loads
+exactly those bytes into its own process.
+
+Source: https://www.nuget.org/packages/BouncyCastle.Cryptography/2.7.0
+  package file  https://api.nuget.org/v3-flatcontainer/bouncycastle.cryptography/2.7.0/bouncycastle.cryptography.2.7.0.nupkg
+  package SHA-512 (as published in the NuGet catalog, base64):
+    Lys+dJthpD8quONaAkRV9ke8DgET0CwBW91NeJjMVHZGvRRNO8DkdReYFfCBOCcvMpzJeC3DuLrpRuntYnq9Iw==
+  source commit: https://github.com/bcgit/bc-csharp (release/v2.7, 4007498b13582d90ee1eda5d9920c324428b98b3)
+
+Files taken unchanged from the package (Authenticode-signed by the publisher):
+  net461/BouncyCastle.Cryptography.dll  (lib/net461, Windows PowerShell 5.1 / .NET Framework 4.8)
+    SHA-256 4f96977e9c67334742c683410b3a361258219f0d3084a5e0bc10fba96cf23a0d
+  net6.0/BouncyCastle.Cryptography.dll  (lib/net6.0, PowerShell 7 - tests)
+    SHA-256 ef92fc661e8d7ba8ec4d39a7cdfcdba41f14cb327f0d24fe79d0b5bb428899b5
+  LICENSE.md
+    SHA-256 be0592a6c76f398356fbf252a4fb43476fb3ca3c45331428c2f4f22c499e8311
