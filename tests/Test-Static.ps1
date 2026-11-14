@@ -77,7 +77,17 @@ foreach ($file in $production) {
 }
 $route = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerRoute.cs'))
 Assert (([regex]::Matches($route, 'new SslStream\(')).Count -eq 1 -and $route -match [regex]::Escape('{ seen = errors; return errors == SslPolicyErrors.None; }')) 'RuTrackerRoute.cs must accept only certificates without errors'
-Assert ($route -match [regex]::Escape('"CONNECT " + host + ":" + port + " HTTP/1.1') -and $route -match [regex]::Escape('stream = Authenticate(stream, proxyHost, true);')) 'the route must use HTTP CONNECT and validate an https proxy like the site'
+Assert ($route -match [regex]::Escape('"CONNECT " + host + ":" + port + " HTTP/1.1') -and $route -match [regex]::Escape('stream = AuthenticateProxy(stream, proxyHost);')) 'the route must use HTTP CONNECT and validate the certificate of an https proxy'
+# TLS with the site only through RuTrackerTls13 (TLS 1.3 on Windows 10; chain + host name); Schannel only for the proxy.
+Assert (([regex]::Matches($route, 'AuthenticateAsClient\(')).Count -eq 1 -and ([regex]::Matches($route, [regex]::Escape('RuTrackerTls13.Connect('))).Count -eq 1 -and
+    $route -match [regex]::Escape('session = RuTrackerTls13.Connect(inner, host, host);')) 'TLS with the site must go through RuTrackerTls13 with the host as the expected name'
+Assert (([regex]::Matches($route, 'return Secure\(')).Count -eq 2 -and $route -match [regex]::Escape('return Secure(Prepare(client), host);') -and $route -match [regex]::Escape('return Secure(stream, host);')) 'every route (direct and proxy) must end in TLS with the site'
+# Another proxy address only before the request and never after a refused certificate or a proxy password request.
+$retry = [regex]::Match($route, '(?s)bool MayTryAnotherAddress\(string code\) \{.*?\n        \}').Value
+Assert ($retry -and $retry -notmatch 'TlsCertificateInvalid|ProxyAuthRequired|Http' -and $retry -match [regex]::Escape('return !proxyCertificateRejected;')) 'proxy failover must stop at certificate and password failures'
+foreach ($file in $production) { Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'TestAddresses' -or $file.Name -eq 'RuTrackerRoute.cs') "$($file.Name) sets test proxy addresses" }
+Assert ($route -match [regex]::Escape('if (name.EndsWith(".test", StringComparison.OrdinalIgnoreCase)) {')) 'test addresses must stay limited to the reserved .test domain'
+Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('const int MaxProxyAttempts = 3;')) 'failover attempt must end before the request'
 Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect') 'RuTrackerRoute.cs is the only transport and never follows redirects'
 Assert (([regex]::Matches($ru, [regex]::Escape('[RuTrackerRoute]::Send('))).Count -eq 1 -and $ru -notmatch 'Invoke-WebRequest|WebRequest\]::Create|HttpClient|Net\.WebProxy') 'RuTracker requests must go through RuTrackerRoute.cs only'
 Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
@@ -94,6 +104,12 @@ foreach ($required in @('if (!x509.Build(leaf))', 'x509.ChainPolicy.Verification
 }
 Assert ($tls13 -notmatch 'AllowUnknownCertificateAuthority|IgnoreInvalidName|IgnoreNotTimeValid|IgnoreWrongUsage|X509VerificationFlags\.All|AllFlags|CustomTrustStore|TrustMode|ChainPolicy\.CustomTrust') 'RuTrackerTls13.cs relaxes certificate validation'
 $loader = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerTls13.ps1'))
+Assert ($loader -match [regex]::Escape("`$script:RuTrackerTransportSources = @('RuTrackerTls13.cs', 'RuTrackerRoute.cs')")) 'the transport must be compiled as one unit by RuTrackerTls13.ps1'
+foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {
+    if ($file.Name -eq 'RuTrackerTls13.ps1') { continue }
+    Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'Add-Type[^\r\n]*RuTracker(Route|Tls13)\.cs') "$($file.Name) loads the transport on its own"
+}
+Assert ($ru -match [regex]::Escape('. "$PSScriptRoot\RuTrackerTls13.ps1"') -and ([regex]::Matches($ru, 'Initialize-RuTrackerNet\r?\n')).Count -eq 2) 'RuTracker.ps1 must use the shared loader'
 Assert ($loader -match [regex]::Escape('if ($hash -ne $entry.sha256) { throw ''TlsLibraryInvalid'' }') -and $loader -match [regex]::Escape('[Reflection.Assembly]::Load($bytes)') -and $loader -notmatch 'LoadFrom|LoadFile|UnsafeLoadFrom|Unblock-File') 'the TLS library must be loaded only from SHA-256-verified bytes'
 $libFiles = @(Get-ChildItem -LiteralPath (Join-Path $repo 'lib') -Recurse -File | ForEach-Object { $_.FullName.Substring($repo.Length + 1).Replace('\', '/') } | Sort-Object)
 Assert (($libFiles -join ',') -eq 'lib/bouncycastle/2.7.0/LICENSE.md,lib/bouncycastle/2.7.0/net461/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/net6.0/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/SOURCE.txt') "unexpected files in lib: $($libFiles -join ', ')"
@@ -136,10 +152,13 @@ foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -File
 }
 
 # --- C# helpers compile with this runtime's compiler (C# 5 under Windows PowerShell 5.1) -----------
-foreach ($type in @('ResumePaths', 'TorrentMetadata', 'RuTrackerRoute')) {
+foreach ($type in @('ResumePaths', 'TorrentMetadata')) {
     if (!($type -as [type])) { Add-Type -Path (Join-Path $repo "$type.cs") }
     Assert ($type -as [type]) "$type did not compile"
 }
+. (Join-Path $repo 'RuTrackerTls13.ps1')
+Initialize-RuTrackerTransport 3>$null
+Assert (('RuTrackerRoute' -as [type]) -and ('RuTrackerTls13' -as [type])) 'the RuTracker transport did not compile'
 
 function Write-Bencode($Stream, $Value) {
     if ($Value -is [byte[]]) {

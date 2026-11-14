@@ -9,16 +9,23 @@ using System.Security.Authentication;
 using System.Text;
 
 // The only network transport of TorrentControl to RuTracker (RuTracker.ps1, Test-RuTrackerConnection.ps1).
+// Compiled together with RuTrackerTls13.cs by RuTrackerTls13.ps1 (Initialize-RuTrackerTransport).
 // Routes:
-//   direct       DNS -> TCP host:443 -> TLS
-//   http proxy   TCP proxy -> "CONNECT host:443" -> TLS inside the tunnel
-//   https proxy  TCP proxy -> TLS to the proxy -> "CONNECT host:443" -> TLS to the host inside it. This is what the
+//   direct       DNS -> TCP host:443 -> TLS with the host
+//   http proxy   TCP proxy -> "CONNECT host:443" -> TLS with the host inside the tunnel
+//   https proxy  TCP proxy -> TLS to the proxy -> "CONNECT host:443" -> TLS with the host inside it. This is what the
 //                official RuTracker browser extension uses (HTTPS ps1.blockme.site:443); neither .NET Framework nor
 //                PowerShell 5.1 can use such a proxy on their own.
-// Every certificate (proxy and rutracker.org) is validated exactly like the default: the callback only records the
-// errors it is given and accepts none. The proxy sees "host:443" only; paths, cookies and passwords travel inside the
-// TLS session with the host. One request per connection, redirects are never followed here, sizes and times are
-// bounded. Nothing is changed in Windows, DNS, routes or proxy settings.
+// TLS to the proxy: SslStream (Windows Schannel, TLS 1.2), certificate validated for the proxy NAME exactly like the
+//   default: the callback only records the errors it is given and accepts none.
+// TLS with the host: RuTrackerTls13.cs only (BouncyCastle, TLS 1.3 or 1.2). Windows 10 Schannel has no TLS 1.3 client,
+//   and rutracker.org behind the official proxy accepts only TLS 1.3. Its certificate must build a Windows X509Chain
+//   to a root trusted on this computer, with the serverAuth usage, valid dates and the host name; nothing relaxes it.
+// The proxy sees "host:443" only; paths, cookies and passwords travel inside the TLS session with the host.
+// A proxy name with several addresses: up to 3 are tried in turn, each attempt ends before any byte of the request
+// is sent, and none follows a rejected certificate or a proxy password request. One request per connection,
+// redirects are never followed here, sizes and times are bounded. Nothing is changed in Windows, DNS, routes or proxy
+// settings.
 public sealed class RuTrackerRouteResult {
     public bool Ok;
     public string Code = "";        // Ok, DnsFailed, ConnectFailed, ProxyUnreachable, ProxyTlsFailed, ProxyAuthRequired,
@@ -27,8 +34,12 @@ public sealed class RuTrackerRouteResult {
     public string Stage = "";       // Dns, Connect, ProxyConnect, ProxyTls, ProxyTunnel, Tls, Http
     public int ProxyStatus;         // status of the CONNECT answer
     public int HttpStatus;          // status of GET <path>
-    public string TlsErrors = "";   // SslPolicyErrors names when a certificate was rejected
-    public int Addresses;           // number of DNS addresses (direct only)
+    public string TlsErrors = "";   // why a certificate or a handshake was refused (fixed texts: SslPolicyErrors names,
+                                    // chain status names, alert names; never a URL, cookie or key)
+    public int Addresses;           // DNS addresses of the host (direct) or of the proxy name
+    public int Attempts;            // proxy addresses tried
+    public string Endpoint = "";    // address:port of the last connection (the proxy, or the host when direct)
+    public string TlsVersion = "";  // TLS version with the host ("TLS 1.3" / "TLS 1.2")
     public long ElapsedMs;
 }
 
@@ -41,6 +52,7 @@ public sealed class RuTrackerHttpResult {
     public string Stage = "";
     public string TlsErrors = "";
     public int ProxyStatus;
+    public string TlsVersion = "";
 }
 
 public sealed class RuTrackerRouteFailure : Exception {
@@ -50,6 +62,11 @@ public sealed class RuTrackerRouteFailure : Exception {
 
 public static class RuTrackerRoute {
     const int MaxHead = 65536;
+
+    // Tests only (tests\Test-RuTrackerTls.ps1): fixed addresses for names under the reserved ".test" domain (RFC 6761,
+    // never resolvable by DNS), so that failover between proxy addresses can be tested on 127.0.0.x. No other name is
+    // looked up here, and no production script fills it (tests\Test-Static.ps1).
+    public static readonly Dictionary<string, IPAddress[]> TestAddresses = new Dictionary<string, IPAddress[]>(StringComparer.OrdinalIgnoreCase);
 
     // Anonymous route check: only the status line of GET <path> is read; no cookie or credential is sent.
     public static RuTrackerRouteResult Check(string proxyHost, int proxyPort, string host, string path, int timeoutMs) {
@@ -62,7 +79,7 @@ public static class RuTrackerRoute {
         try {
             Stream stream = connection.Open(proxyScheme, proxyHost, proxyPort, host, 443, "TorrentControl-route-check");
             connection.Stage = "Http";
-            Send(stream, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: TorrentControl-route-check\r\nAccept: text/html\r\nConnection: close\r\n\r\n");
+            Send(stream, "GET " + path + " HTTP/1.1\r\nHost: " + host + "\r\nUser-Agent: TorrentControl-route-check\r\nAccept: text/html\r\nAccept-Encoding: identity\r\nConnection: close\r\n\r\n");
             result.HttpStatus = StatusOf(ReadUntil(stream, "\r\n", 2048));
             if (result.HttpStatus >= 200 && result.HttpStatus < 400) { result.Ok = true; result.Code = "Ok"; }
             else if (result.HttpStatus == 403) result.Code = "HttpForbidden";
@@ -76,6 +93,9 @@ public static class RuTrackerRoute {
             result.ProxyStatus = connection.ProxyStatus;
             result.TlsErrors = connection.TlsErrors;
             result.Addresses = connection.Addresses;
+            result.Attempts = connection.Attempts;
+            result.Endpoint = connection.Endpoint;
+            result.TlsVersion = connection.TlsVersion;
             result.ElapsedMs = watch.ElapsedMilliseconds;
         }
         return result;
@@ -95,12 +115,14 @@ public static class RuTrackerRoute {
             RuTrackerHttpResult answer = Exchange(stream, method, uri, cookies, contentType, body, userAgent, maxBody);
             answer.Stage = connection.Stage;
             answer.ProxyStatus = connection.ProxyStatus;
+            answer.TlsVersion = connection.TlsVersion;
             return answer;
         } catch (Exception e) {
             result.Error = connection.Classify(e);
             result.Stage = connection.Stage;
             result.ProxyStatus = connection.ProxyStatus;
             result.TlsErrors = connection.TlsErrors;
+            result.TlsVersion = connection.TlsVersion;
             return result;
         } finally {
             connection.Dispose();
@@ -161,87 +183,180 @@ public static class RuTrackerRoute {
         return result;
     }
 
-    // A rejected certificate is reported as such; any other handshake failure is a TLS failure. Never accepted.
-    public static string TlsCode(SslPolicyErrors errors) {
-        return errors == SslPolicyErrors.None ? "TlsFailed" : "TlsCertificateInvalid";
-    }
-
     sealed class Connection : IDisposable {
+        const int MaxProxyAttempts = 3;
+        // Last proxy address that gave a full route, per proxy name and port (this process only, nothing is stored).
+        static readonly Dictionary<string, string> LastGood = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly int timeoutMs;
+        readonly Stopwatch watch = Stopwatch.StartNew();
         readonly List<IDisposable> owned = new List<IDisposable>();
+        bool proxyCertificateRejected;
         public string Stage = "";
         public int ProxyStatus;
         public string TlsErrors = "";
         public int Addresses;
+        public int Attempts;
+        public string Endpoint = "";
+        public string TlsVersion = "";
         public Connection(int timeoutMs) { this.timeoutMs = timeoutMs; }
 
         public Stream Open(string proxyScheme, string proxyHost, int proxyPort, string host, int port, string agent) {
-            Stream stream;
             if (string.IsNullOrEmpty(proxyScheme)) {
                 Stage = "Dns";
-                IPAddress[] addresses;
-                try {
-                    IAsyncResult lookup = Dns.BeginGetHostAddresses(host, null, null);
-                    if (!lookup.AsyncWaitHandle.WaitOne(timeoutMs)) throw new RuTrackerRouteFailure("Timeout");
-                    addresses = Dns.EndGetHostAddresses(lookup);
-                } catch (SocketException) { throw new RuTrackerRouteFailure("DnsFailed"); }
+                IPAddress[] addresses = Resolve(host);
                 Addresses = addresses.Length;
                 if (addresses.Length == 0) throw new RuTrackerRouteFailure("DnsFailed");
                 Stage = "Connect";
                 TcpClient client = null;
                 string failure = "";
                 foreach (IPAddress address in addresses) {
-                    failure = TryConnect(address.ToString(), port, out client);
+                    Endpoint = Format(address, port);
+                    failure = TryConnect(address, port, out client);
                     if (client != null) break;
                 }
                 if (client == null) throw new RuTrackerRouteFailure(failure == "Timeout" ? "Timeout" : "ConnectFailed");
-                stream = Prepare(client);
-            } else {
-                if (proxyScheme != "http" && proxyScheme != "https") throw new RuTrackerRouteFailure("ProxyUnsupported");
-                Stage = "ProxyConnect";
-                TcpClient client;
-                string failure = TryConnect(proxyHost, proxyPort, out client);
-                if (client == null) throw new RuTrackerRouteFailure(failure == "Timeout" ? "Timeout" : "ProxyUnreachable");
-                stream = Prepare(client);
-                if (proxyScheme == "https") {
-                    Stage = "ProxyTls";
-                    stream = Authenticate(stream, proxyHost, true);
-                }
-                Stage = "ProxyTunnel";
-                Send(stream, "CONNECT " + host + ":" + port + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\nUser-Agent: " + agent + "\r\n\r\n");
-                ProxyStatus = StatusOf(ReadUntil(stream, "\r\n\r\n", 16384));
-                if (ProxyStatus == 407) throw new RuTrackerRouteFailure("ProxyAuthRequired");
-                if (ProxyStatus != 200) throw new RuTrackerRouteFailure("ProxyRefused");   // includes a closed connection (0)
+                return Secure(Prepare(client), host);
             }
-            Stage = "Tls";
-            return Authenticate(stream, host, false);
+            if (proxyScheme != "http" && proxyScheme != "https") throw new RuTrackerRouteFailure("ProxyUnsupported");
+            Stage = "ProxyConnect";
+            string key = proxyHost + ":" + proxyPort;
+            IPAddress[] proxies = Prefer(Resolve(proxyHost), key);
+            Addresses = proxies.Length;
+            if (proxies.Length == 0) throw new RuTrackerRouteFailure("ProxyUnreachable");
+            for (int i = 0; ; i++) {
+                Attempts = i + 1;
+                try {
+                    Stream stream = ThroughProxy(proxyScheme == "https", proxyHost, proxies[i], proxyPort, host, port, agent);
+                    lock (LastGood) { LastGood[key] = proxies[i].ToString(); }
+                    return stream;
+                } catch (Exception e) {
+                    string code = Classify(e);
+                    bool last = i + 1 >= proxies.Length || i + 1 >= MaxProxyAttempts || watch.ElapsedMilliseconds > 2L * timeoutMs;
+                    if (last || !MayTryAnotherAddress(code)) throw new RuTrackerRouteFailure(code);
+                    Release();
+                }
+            }
         }
 
-        SslStream Authenticate(Stream inner, string name, bool proxy) {
+        // One proxy address: nothing of the request is sent here, only CONNECT host:port and the TLS handshakes.
+        Stream ThroughProxy(bool proxyTls, string proxyHost, IPAddress address, int proxyPort, string host, int port, string agent) {
+            Stage = "ProxyConnect";
+            ProxyStatus = 0;
+            TlsErrors = "";
+            TlsVersion = "";
+            proxyCertificateRejected = false;
+            Endpoint = Format(address, proxyPort);
+            TcpClient client;
+            string failure = TryConnect(address, proxyPort, out client);
+            if (client == null) throw new RuTrackerRouteFailure(failure == "Timeout" ? "Timeout" : "ProxyUnreachable");
+            Stream stream = Prepare(client);
+            if (proxyTls) {
+                Stage = "ProxyTls";
+                stream = AuthenticateProxy(stream, proxyHost);
+            }
+            Stage = "ProxyTunnel";
+            Send(stream, "CONNECT " + host + ":" + port + " HTTP/1.1\r\nHost: " + host + ":" + port + "\r\nUser-Agent: " + agent + "\r\n\r\n");
+            ProxyStatus = StatusOf(ReadUntil(stream, "\r\n\r\n", 16384));
+            if (ProxyStatus == 407) throw new RuTrackerRouteFailure("ProxyAuthRequired");
+            if (ProxyStatus != 200) throw new RuTrackerRouteFailure("ProxyRefused");   // includes a closed connection (0)
+            return Secure(stream, host);
+        }
+
+        // Another address of the same proxy is tried only for failures of that address; never after a certificate was
+        // rejected (proxy or site) or the proxy asked for a password.
+        bool MayTryAnotherAddress(string code) {
+            switch (code) {
+                case "ProxyUnreachable":
+                case "Timeout":
+                case "ProxyRefused":
+                case "TlsFailed":
+                    return true;
+                case "ProxyTlsFailed":
+                    return !proxyCertificateRejected;
+                default:
+                    return false;
+            }
+        }
+
+        // TLS with the host: RuTrackerTls13 (TLS 1.3 / 1.2, Windows chain + host name). The only TLS path to the site.
+        Stream Secure(Stream inner, string host) {
+            Stage = "Tls";
+            RuTrackerTls13Session session;
+            try {
+                session = RuTrackerTls13.Connect(inner, host, host);
+            } catch (RuTrackerTls13Failure e) {
+                TlsErrors = e.Detail;
+                throw new RuTrackerRouteFailure(e.Code);
+            }
+            owned.Add(session);
+            TlsVersion = session.Version;
+            return session.Stream;
+        }
+
+        Stream AuthenticateProxy(Stream inner, string name) {
             SslPolicyErrors seen = SslPolicyErrors.None;
             var ssl = new SslStream(inner, false, (sender, certificate, chain, errors) => { seen = errors; return errors == SslPolicyErrors.None; });
             owned.Add(ssl);
             try {
                 ssl.AuthenticateAsClient(name, null, SslProtocols.Tls12, false);
             } catch (AuthenticationException) {
-                TlsErrors = seen == SslPolicyErrors.None ? "" : seen.ToString();
-                throw new RuTrackerRouteFailure(proxy ? "ProxyTlsFailed" : TlsCode(seen));
+                proxyCertificateRejected = seen != SslPolicyErrors.None;
+                TlsErrors = proxyCertificateRejected ? seen.ToString() : "";
+                throw new RuTrackerRouteFailure("ProxyTlsFailed");
             }
             return ssl;
         }
 
-        string TryConnect(string host, int port, out TcpClient client) {
+        // IPv4 first (then IPv6), DNS order within each family. A literal address is used as it is.
+        IPAddress[] Resolve(string name) {
+            IPAddress literal;
+            if (IPAddress.TryParse(name, out literal)) return new[] { literal };
+            if (name.EndsWith(".test", StringComparison.OrdinalIgnoreCase)) {
+                IPAddress[] assigned;
+                lock (TestAddresses) { if (TestAddresses.TryGetValue(name, out assigned)) return (IPAddress[])assigned.Clone(); }
+                return new IPAddress[0];
+            }
+            IPAddress[] found;
+            IAsyncResult lookup = Dns.BeginGetHostAddresses(name, null, null);
+            if (!lookup.AsyncWaitHandle.WaitOne(timeoutMs)) throw new RuTrackerRouteFailure("Timeout");
+            try { found = Dns.EndGetHostAddresses(lookup); } catch (SocketException) { return new IPAddress[0]; }
+            var ordered = new List<IPAddress>();
+            foreach (IPAddress address in found) if (address.AddressFamily == AddressFamily.InterNetwork) ordered.Add(address);
+            foreach (IPAddress address in found) if (address.AddressFamily == AddressFamily.InterNetworkV6) ordered.Add(address);
+            return ordered.ToArray();
+        }
+
+        static IPAddress[] Prefer(IPAddress[] addresses, string key) {
+            string good;
+            lock (LastGood) { if (!LastGood.TryGetValue(key, out good)) return addresses; }
+            var list = new List<IPAddress>(addresses);
+            for (int i = 1; i < list.Count; i++) {
+                if (list[i].ToString() != good) continue;
+                IPAddress preferred = list[i];
+                list.RemoveAt(i);
+                list.Insert(0, preferred);
+                break;
+            }
+            return list.ToArray();
+        }
+
+        static string Format(IPAddress address, int port) {
+            return address.AddressFamily == AddressFamily.InterNetworkV6 ? "[" + address + "]:" + port : address + ":" + port;
+        }
+
+        string TryConnect(IPAddress address, int port, out TcpClient client) {
             client = null;
-            var candidate = new TcpClient();
+            TcpClient candidate = null;
             try {
-                IAsyncResult connect = candidate.BeginConnect(host, port, null, null);
+                candidate = new TcpClient(address.AddressFamily);   // throws where IPv6 is off: that address is skipped
+                IAsyncResult connect = candidate.BeginConnect(address, port, null, null);
                 if (!connect.AsyncWaitHandle.WaitOne(timeoutMs)) { candidate.Close(); return "Timeout"; }
                 candidate.EndConnect(connect);
                 owned.Add(candidate);
                 client = candidate;
                 return "";
             } catch (Exception e) {
-                candidate.Close();
+                if (candidate != null) candidate.Close();
                 return IsTimeout(e) ? "Timeout" : "Refused";
             }
         }
@@ -270,10 +385,13 @@ public static class RuTrackerRoute {
             }
         }
 
-        public void Dispose() {
+        // Closes in reverse order: TLS with the host (close_notify), TLS with the proxy, then the socket.
+        void Release() {
             for (int i = owned.Count - 1; i >= 0; i--) { try { owned[i].Dispose(); } catch { } }
             owned.Clear();
         }
+
+        public void Dispose() { Release(); }
     }
 
     static void Send(Stream stream, string text) {
@@ -304,11 +422,16 @@ public static class RuTrackerRoute {
         return buffer;
     }
 
+    // A body without Content-Length or chunks ends with the connection ("Connection: close"). A server that closes the
+    // TLS session without close_notify ends it as well (BouncyCastle reports EndOfStreamException); a cut .torrent
+    // then fails the bencode and infohash checks of RuTracker.ps1, a cut page cannot carry the session cookie.
     static byte[] ReadToEnd(Stream stream, int maxBody) {
         var memory = new MemoryStream();
         var buffer = new byte[65536];
-        int read;
-        while ((read = stream.Read(buffer, 0, buffer.Length)) > 0) {
+        while (true) {
+            int read;
+            try { read = stream.Read(buffer, 0, buffer.Length); } catch (EndOfStreamException) { break; }
+            if (read <= 0) break;
             memory.Write(buffer, 0, read);
             if (memory.Length > maxBody) throw new RuTrackerRouteFailure("ResponseTooLarge");
         }
@@ -328,7 +451,8 @@ public static class RuTrackerRoute {
                 throw new RuTrackerRouteFailure("HttpUnexpected");
             if (size == 0) {
                 for (int trailers = 0; trailers < 64; trailers++) {   // trailer lines up to the empty one (or the end)
-                    string trailer = ReadUntil(stream, "\r\n", 1024);
+                    string trailer;
+                    try { trailer = ReadUntil(stream, "\r\n", 1024); } catch (EndOfStreamException) { break; }
                     if (trailer == "\r\n" || !trailer.EndsWith("\r\n", StringComparison.Ordinal)) break;
                 }
                 return memory.ToArray();

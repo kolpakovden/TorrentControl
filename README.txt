@@ -1,7 +1,7 @@
 TORRENTCONTROL 1.8
 
 ОБНОВЛЕНИЕ
-Замените исходные файлы в C:\TorrentMonitor.
+Замените исходные файлы в C:\TorrentMonitor (вместе с папкой lib).
 Сохраните config.json, credential.xml, state.json, feed-state.json,
 а также autoload.json, auto-state.json и файлы *.json.bak, если они уже существуют.
 1-Setup.cmd и 6-Enable-autoload.cmd при обновлении с 1.7 повторно запускать не нужно.
@@ -17,6 +17,9 @@ TORRENTCONTROL 1.8
 расширения RuTracker (HTTPS-прокси ps1.blockme.site:443, как в Firefox) и локальный прокси Hiddify
 и после ввода YES запишет рабочий в rutracker-proxy.txt.
 Прокси используется только для запросов TorrentControl к RuTracker; настройки Windows не меняются.
+Сайт за этим прокси работает только по TLS 1.3, которого нет в Windows 10: его выполняет библиотека
+BouncyCastle из папки lib (проверяется по SHA-256). Папку lib копируйте вместе со скриптами;
+без неё запросы к RuTracker не выполняются (RuTrackerTlsComponentInvalid).
 Пароль и cookie зашифрованы DPAPI; на GitHub не передаются.
 Если TorrentControl не достаёт до RuTracker, а Firefox может: скачайте персональный .torrent в Firefox и
 импортируйте 16-Import-personal-torrent.cmd (без сети; файл сверяется с auto-state.json по hash).

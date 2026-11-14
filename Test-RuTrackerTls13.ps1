@@ -53,7 +53,7 @@ if ($MyInvocation.InvocationName -ne '.') {
     $report = New-Object Collections.Generic.List[string]
     $exitCode = 0
     try {
-        Initialize-RuTrackerTls13 3>$null
+        Initialize-RuTrackerTransport 3>$null
         $uri = [Uri]$Proxy
         if ($uri.Scheme -notin @('http', 'https') -or $uri.UserInfo) { throw 'ProxyInvalid' }
         $timeout = [math]::Max(3, $TimeoutSec) * 1000

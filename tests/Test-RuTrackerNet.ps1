@@ -1,7 +1,7 @@
 ﻿. "$PSScriptRoot\TestCommon.ps1"
 . "$PSScriptRoot\..\AutoLoad.ps1"
 . "$PSScriptRoot\..\Test-RuTrackerConnection.ps1"
-if (!('RuTrackerRoute' -as [type])) { Add-Type -Path "$PSScriptRoot\..\RuTrackerRoute.cs" }
+Initialize-RuTrackerTransport 3>$null   # RuTrackerRoute.cs + RuTrackerTls13.cs with the pinned library (loaded via RuTracker.ps1)
 if (!('FakeProxy' -as [type])) { Add-Type -Path "$PSScriptRoot\FakeProxy.cs" }
 # Network layer with real sockets, but only to fake proxies on 127.0.0.1 (tests\FakeProxy.cs) and to the reserved
 # name rutracker.invalid: nothing reaches rutracker.org, Hiddify or any other real service. Fake secrets only.
@@ -53,11 +53,7 @@ try {
     # Direct connection with a DNS failure (reserved name, never resolvable).
     $r = [RuTrackerRoute]::Check('', 0, 'rutracker.invalid', '/forum/index.php', 5000)
     Assert (!$r.Ok -and $r.Stage -eq 'Dns' -and $r.Code -in @('DnsFailed', 'Timeout')) "direct DNS failure: $($r.Code)/$($r.Stage)"
-    # Certificate errors are reported as such and never accepted (the callback only records them).
-    foreach ($errors in @('RemoteCertificateChainErrors', 'RemoteCertificateNameMismatch', 'RemoteCertificateNotAvailable')) {
-        Assert ([RuTrackerRoute]::TlsCode([Net.Security.SslPolicyErrors]$errors) -eq 'TlsCertificateInvalid') "$errors not a certificate error"
-    }
-    Assert ([RuTrackerRoute]::TlsCode([Net.Security.SslPolicyErrors]::None) -eq 'TlsFailed') 'handshake failure without certificate errors'
+    # Certificates with real TLS servers (rejected chain, name, dates, usage; proxy certificate): Test-RuTrackerTls.ps1.
 
     # --- Error classification: fixed codes from the exception chain, never the message ----------------------
     function New-WebError([string]$Status, $Inner = $null) { return (New-Object Net.WebException('https://rutracker.org/forum/login.php?kk=FAKE', $Inner, [Net.WebExceptionStatus]$Status, $null)) }

@@ -3,8 +3,8 @@
 if (!('FakeProxy' -as [type])) { Add-Type -Path "$PSScriptRoot\FakeProxy.cs" }
 # TLS 1.3 component (RuTrackerTls13.cs + pinned BouncyCastle). Offline: only fake servers on 127.0.0.1.
 $repo = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
-Initialize-RuTrackerTls13 3>$null
-Assert ('RuTrackerTls13' -as [type]) 'TLS 1.3 component did not compile with the pinned library'
+Initialize-RuTrackerTransport 3>$null
+Assert (('RuTrackerTls13' -as [type]) -and ('RuTrackerRoute' -as [type])) 'transport did not compile with the pinned library'
 
 # --- Pinned library: constants = SOURCE.txt = the files ----------------------------------------------------
 $source = [IO.File]::ReadAllText((Join-Path $repo 'lib\bouncycastle\2.7.0\SOURCE.txt'))
@@ -20,7 +20,7 @@ foreach ($case in @(@('replaced', 'TlsLibraryInvalid'), @('missing', 'TlsLibrary
     $copy = Join-Path $PSScriptRoot ('autoload-test-' + [guid]::NewGuid().ToString('N'))
     try {
         $null = Microsoft.PowerShell.Management\New-Item -Path $copy -ItemType Directory
-        foreach ($name in @('RuTrackerTls13.ps1', 'RuTrackerTls13.cs')) { Microsoft.PowerShell.Management\Copy-Item -LiteralPath (Join-Path $repo $name) -Destination $copy }
+        foreach ($name in @('RuTrackerTls13.ps1', 'RuTrackerTls13.cs', 'RuTrackerRoute.cs')) { Microsoft.PowerShell.Management\Copy-Item -LiteralPath (Join-Path $repo $name) -Destination $copy }
         if ($case[0] -eq 'replaced') {
             foreach ($edition in @('net461', 'net6.0')) {
                 $dir = Join-Path $copy "lib\bouncycastle\2.7.0\$edition"
@@ -31,7 +31,7 @@ foreach ($case in @(@('replaced', 'TlsLibraryInvalid'), @('missing', 'TlsLibrary
             }
         }
         $script = Join-Path $copy 'RuTrackerTls13.ps1'
-        $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '$script'; try { Initialize-RuTrackerTls13 3>`$null; 'LOADED' } catch { `$_.Exception.Message }" 2>&1 | Out-String
+        $out = & $exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -Command ". '$script'; try { Initialize-RuTrackerTransport 3>`$null; 'LOADED' } catch { `$_.Exception.Message }" 2>&1 | Out-String
         Assert ($out.Trim() -eq $case[1]) "$($case[0]) library: '$($out.Trim())'"
     } finally { Remove-TestDirectory $copy }
 }

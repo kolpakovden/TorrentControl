@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\RuTracker.ps1"
 $explain = @{
     SetupCancelled = 'Ввод отменён.'
+    SetupNothingToCheck = 'Вход выполнен, но для всех текущих тем ленты персональные файлы уже есть: скачивать нечего. Повторите 10-RuTracker-check.cmd после выхода новых фильмов.'
     RuTrackerLoginFailed = 'RuTracker не принял логин или пароль. Проверьте их в браузере и повторите.'
     RuTrackerCaptchaRequired = 'RuTracker требует CAPTCHA, а код не подошёл. Повторите 9-RuTracker-login.cmd.'
     RuTrackerNotConfigured = 'Вход не настроен: запустите 9-RuTracker-login.cmd.'
@@ -15,6 +16,7 @@ $explain = @{
     RuTrackerUnavailable = 'rutracker.org недоступен с этого компьютера напрямую. Запустите 15-RuTracker-connection.cmd: он проверит маршрут официального расширения RuTracker (как в Firefox) и локальный прокси Hiddify и запишет рабочий в rutracker-proxy.txt.'
     RuTrackerProxyUnavailable = 'Прокси из rutracker-proxy.txt не отвечает или отказал. Запустите 15-RuTracker-connection.cmd, чтобы найти рабочий маршрут.'
     RuTrackerTlsFailed = 'Защищённое соединение с rutracker.org не установлено (сертификат или TLS). Пароль не отправлялся. Проверка сертификатов не отключается.'
+    RuTrackerTlsComponentInvalid = 'Нет папки lib\bouncycastle рядом со скриптами или её файл изменён (SHA-256 не совпал). Скопируйте папку lib из той же версии TorrentControl. Пароль не запрашивался и не отправлялся.'
     RuTrackerBlocked = 'rutracker.org ответил 403/429 (доступ запрещён или слишком много запросов). Повторите позже.'
     RuTrackerRedirectRefused = 'RuTracker перенаправил запрос на другой адрес; запрос не выполнен.'
     RuTrackerProxyInvalid = 'rutracker-proxy.txt должен содержать одну строку вида http://адрес:порт (без логина и пароля).'
@@ -36,7 +38,11 @@ try {
     else { Write-Host 'Запросы к RuTracker идут напрямую (rutracker-proxy.txt нет, прокси Windows не задан).' }
     # The route is checked anonymously before the password is asked for and sent.
     Assert-RuTrackerRoute
-    Write-Host 'Соединение с rutracker.org проверено (TLS, сертификат действителен).'
+    $route = $script:RuTrackerLastRoute
+    $detail = 'TLS'
+    if ($route -and $route.TlsVersion) { $detail = [string]$route.TlsVersion }
+    if ($route -and [int]$route.Attempts -gt 0) { $detail += '; адрес прокси ' + $route.Endpoint }
+    Write-Host ('Соединение с rutracker.org проверено (' + $detail + ', сертификат rutracker.org действителен).')
     if (!$Check) {
         Write-Host 'Вход в RuTracker для персональных .torrent. Пароль хранится зашифрованным для этой учётной записи Windows (DPAPI)'
         Write-Host 'и отправляется только на rutracker.org. На GitHub не передаётся ничего из этих данных.'
@@ -63,21 +69,30 @@ try {
         Save-RuTrackerState $PSScriptRoot '' -LoginAttempt
         Write-Host 'Вход выполнен.'
     }
-    # End-to-end check: the personal .torrent of a current topic from the public feed, infohash and announce verified.
+    # End-to-end check over the network: the personal .torrent of a current topic from the public feed, infohash and
+    # announce verified, stored in %LOCALAPPDATA%\TorrentControl\personal. Nothing is added to uTorrent. Topics whose
+    # personal file is already stored (imported from Firefox or downloaded earlier) prove nothing about the network
+    # and are skipped; at most 3 topics are requested.
     $snapshot = Read-MirrorText ($script:FeedMirrorBase + 'forum-252.json') 30 | ConvertFrom-Json
-    $entries = @(Convert-FilmFeed ([string]$snapshot.xml) | Where-Object { $_.hash } | Select-Object -First 3)
+    $entries = @(Convert-FilmFeed ([string]$snapshot.xml) | Where-Object { $_.hash } | Select-Object -First 20)
     $personal = $null
+    $requested = 0
     foreach ($entry in $entries) {
+        if (Test-Path -LiteralPath (Get-PersonalTorrentPath $entry.hash)) { continue }
+        if ($requested -ge 3) { break }
+        $requested++
         try { $personal = Get-PersonalTorrent $PSScriptRoot $entry.topic $entry.hash; break }
         catch { if ((Get-RuTrackerCode $_.Exception) -ne 'PersonalHashMismatch') { throw } }
     }
+    if ($requested -eq 0) { throw 'SetupNothingToCheck' }
     if ($null -eq $personal) { throw 'PersonalHashMismatch' }
     Save-RuTrackerState $PSScriptRoot '' $personal.host
-    Write-Host ('ПРОВЕРКА ПРОЙДЕНА: персональный .torrent темы ' + $entry.topic + ' получен, infohash совпадает с лентой, сервер статистики: ' + $personal.host + ' (ключ не показывается).')
+    Write-Host ('ПРОВЕРКА ПРОЙДЕНА: персональный .torrent темы ' + $entry.topic + ' скачан с RuTracker, infohash совпадает с лентой, сервер статистики: ' + $personal.host + ' (ключ не показывается).')
+    Write-Host ('Файл: ' + $personal.path + '. В µTorrent ничего не добавлено.')
     Write-Host 'Это подтверждает получение файла. Начисление отдачи нужно проверить в профиле RuTracker (README, план проверки).'
 } catch {
     $code = Get-RuTrackerCode $_.Exception
-    if ([string]$_.Exception.Message -eq 'SetupCancelled') { $code = 'SetupCancelled' }
+    if ([string]$_.Exception.Message -in @('SetupCancelled', 'SetupNothingToCheck')) { $code = [string]$_.Exception.Message }
     Write-Host ('RuTracker: ' + $code + ' — ' + $explain[$code]) -ForegroundColor Red
     exit 1
 } finally { if ($lock) { $lock.Dispose() } }

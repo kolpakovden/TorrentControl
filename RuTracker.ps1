@@ -8,6 +8,9 @@
 # Nothing here talks to GitHub. The password and session cookies are stored with Windows DPAPI for the current
 # Windows user (like credential.xml); personal .torrent files go to %LOCALAPPDATA%\TorrentControl\personal.
 # Passwords, cookies and announce keys are never written to logs, reports or the autoload journal.
+# Network: RuTrackerRoute.cs + RuTrackerTls13.cs (TLS 1.3 with the site through the pinned BouncyCastle library),
+# loaded by RuTrackerTls13.ps1; no other transport to RuTracker exists.
+. "$PSScriptRoot\RuTrackerTls13.ps1"
 $script:RuTrackerForum = 'https://rutracker.org/forum/'
 $script:PublicAnnounce = 'http://bt.t-ru.org/ann?magnet'
 # RuTracker tracker servers: host bt, bt2, bt3, ... (number not fixed) on a confirmed domain, path exactly /ann.
@@ -36,7 +39,7 @@ $script:RuTrackerRouteOkAt = $null
 $script:RuTrackerRouteOkFor = $null
 $script:RuTrackerLastRoute = $null
 $script:RuTrackerCodes = @('RuTrackerNotConfigured','RuTrackerCredentialUnreadable','RuTrackerProxyInvalid','PersonalTrackersUnexpected',
-    'RuTrackerProxyUnavailable','RuTrackerTlsFailed','RuTrackerBlocked','RuTrackerRedirectRefused','PersonalImportInvalid','PersonalTopicMismatch','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
+    'RuTrackerProxyUnavailable','RuTrackerTlsFailed','RuTrackerTlsComponentInvalid','RuTrackerBlocked','RuTrackerRedirectRefused','PersonalImportInvalid','PersonalTopicMismatch','RuTrackerLoginFailed','RuTrackerCaptchaRequired','RuTrackerAuthExpired',
     'RuTrackerUnavailable','RuTrackerTopicUnavailable','PersonalTorrentInvalid','PersonalHashMismatch','PersonalAnnounceMissing','LocalAppDataMissing')
 
 function Add-RuTrackerSecret([string]$Value) { if ($Value -and $Value.Length -ge 4 -and !$script:RuTrackerSecrets.Contains($Value)) { $script:RuTrackerSecrets.Add($Value) } }
@@ -220,10 +223,15 @@ function Resolve-RuTrackerProxy([string]$Directory) {
     if (!$proxy) { $proxy = Get-SystemRuTrackerProxy }
     return $proxy
 }
+function Initialize-RuTrackerNet {
+    # The transport (RuTrackerRoute.cs, RuTrackerTls13.cs, lib\bouncycastle with its pinned SHA-256). A missing, replaced
+    # or uncompilable part stops every RuTracker request with one code; there is no other way to reach RuTracker.
+    try { Initialize-RuTrackerTransport 3>$null } catch { throw 'RuTrackerTlsComponentInvalid' }
+}
 function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
     # Anonymous: TCP, TLS to an https proxy, CONNECT, TLS with normal certificate validation, status of
     # /forum/index.php (RuTrackerRoute.cs). No cookie or credential.
-    if (!('RuTrackerRoute' -as [type])) { Add-Type -Path "$PSScriptRoot\RuTrackerRoute.cs" }
+    Initialize-RuTrackerNet
     if ($TimeoutMs -le 0) { $TimeoutMs = $script:RuTrackerCheckTimeoutMs }
     $route = Get-RuTrackerRouteParts $Proxy
     return [RuTrackerRoute]::Check($route.scheme, $route.host, $route.port, $HostName, '/forum/index.php', $TimeoutMs)
@@ -293,7 +301,7 @@ function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$
     # never carried to another address. Certificates are validated as usual; on any network or TLS failure only a
     # fixed code is returned, never an exception text. Replaced by stubs in most tests.
     if ($Url -notmatch '^https://(rutracker\.org/forum/|static\.rutracker\.cc/captcha/)') { throw 'RuTrackerRedirectRefused' }
-    if (!('RuTrackerRoute' -as [type])) { Add-Type -Path "$PSScriptRoot\RuTrackerRoute.cs" }
+    Initialize-RuTrackerNet
     $route = Get-RuTrackerRouteParts $script:RuTrackerProxy
     $body = $null; $type = ''
     if ($Form) { $body = [Text.Encoding]::ASCII.GetBytes($Form); $type = 'application/x-www-form-urlencoded' }

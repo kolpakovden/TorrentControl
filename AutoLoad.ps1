@@ -9,7 +9,7 @@
 function Get-AutoErrorCode($Exception) {
     $allowed=@('UnknownIncompletePath','UnknownRemainingSize','UnsupportedRow','DestinationNotAllowed','DestinationReparseOrFile','WebUINotLocal','ExpectedOneLocalClient','InvalidAutoSettings','AutoBaselineMissing','AutoStateBackupPresent','ReviewCancelled','FreeSpaceUnknown','InvalidAutoState','DriveDUnavailable','TokenMissing','TorrentListMissing')
     if ($Exception.Message -in $allowed) {return $Exception.Message}
-    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|ProxyUnavailable|TlsFailed|Blocked|RedirectRefused|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing|TrackersUnexpected|ImportInvalid|TopicMismatch)|LocalAppDataMissing)$') {return $Exception.Message}
+    if ($Exception.Message -match '^(RuTracker(NotConfigured|CredentialUnreadable|ProxyInvalid|ProxyUnavailable|TlsFailed|TlsComponentInvalid|Blocked|RedirectRefused|LoginFailed|CaptchaRequired|AuthExpired|Unavailable|TopicUnavailable)|Personal(TorrentInvalid|HashMismatch|AnnounceMissing|TrackersUnexpected|ImportInvalid|TopicMismatch)|LocalAppDataMissing)$') {return $Exception.Message}
     if ($Exception.Message -match '^ClientDataInvalid:(Format|Hash|DuplicateHash|Status|Size|Progress|Downloaded|Uploaded|UploadSpeed|PeersConnected|Remaining)$') {return $Exception.Message}
     return 'SeeClientAndConfiguration'
 }
@@ -159,6 +159,7 @@ function Write-AutoReport($State,[string]$Directory) {
         RuTrackerUnavailable='rutracker.org недоступен с этого компьютера напрямую: нужен маршрут в rutracker-proxy.txt (15-RuTracker-connection.cmd, README). Публичная версия не добавляется.'
         RuTrackerProxyUnavailable='Прокси для RuTracker из rutracker-proxy.txt не отвечает или отказал; повтор при следующем опросе (проверка: 15-RuTracker-connection.cmd). Публичная версия не добавляется.'
         RuTrackerTlsFailed='Защищённое соединение с rutracker.org не установлено (сертификат или TLS); пароль и cookie не отправлялись. Публичная версия не добавляется.'
+        RuTrackerTlsComponentInvalid='Нет папки lib\bouncycastle рядом со скриптами или её файл изменён (SHA-256 не совпал): скопируйте папку lib из той же версии TorrentControl. Запросы к RuTracker не выполняются, публичная версия не добавляется.'
         RuTrackerBlocked='rutracker.org отказал в доступе (HTTP 403/429); повтор при следующем опросе. Публичная версия не добавляется.'
         RuTrackerRedirectRefused='RuTracker перенаправил запрос за пределы rutracker.org/forum; запрос не выполнен. Публичная версия не добавляется.'
         RuTrackerTopicUnavailable='Тема недоступна на RuTracker; повтор при следующем опросе.'

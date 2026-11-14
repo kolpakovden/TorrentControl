@@ -70,6 +70,23 @@
 `http://px2.blockme.site:3128`) — это другой маршрут, и на этом ПК он не отвечает. Ни .NET Framework, ни
 Windows PowerShell 5.1 сами HTTPS-прокси не поддерживают, поэтому у TorrentControl свой транспорт
 `RuTrackerRoute.cs`. Расширение и данные Firefox TorrentControl не использует и не читает.
+
+**TLS 1.3 на Windows 10.** Сайт за этим прокси принимает только TLS 1.3 (на `ClientHello` TLS 1.2 он отвечает
+`protocol_version`), а Schannel в Windows 10 не умеет TLS 1.3 как клиент. Поэтому TLS с `rutracker.org` внутри
+туннеля выполняет `RuTrackerTls13.cs` на библиотеке BouncyCastle.Cryptography 2.7.0 (MIT,
+`lib\bouncycastle\2.7.0`, происхождение и хеши — в `SOURCE.txt`). Проверено на ПК пользователя (Windows 10 22H2,
+PowerShell 5.1): CONNECT 200, TLS 1.3, сертификат `rutracker.org` от Let's Encrypt, ответ 200.
+- Библиотека ничего не устанавливает и не регистрирует: `RuTrackerTls13.ps1` читает DLL, сравнивает SHA-256
+  с зашитым значением и загружает в процесс именно эти байты. Нет папки `lib`, или файл заменён — ни одного запроса
+  к RuTracker, код `RuTrackerTlsComponentInvalid`.
+- Сертификат сайта принимается, только если Windows (`X509Chain`) строит цепочку до доверенного корня этого
+  компьютера с назначением «проверка подлинности сервера» и действующими датами, и в нём есть имя `rutracker.org`.
+  Исключений и ослаблений нет; TLS с самим прокси — по-прежнему Windows (Schannel, TLS 1.2) с проверкой имени
+  прокси. Второго способа связи с RuTracker нет.
+- У имени прокси несколько адресов (у `ps1.blockme.site` их 9). Если адрес не отвечает, обрывает соединение, не
+  открывает туннель или TLS внутри него не устанавливается, пробуется следующий, всего не больше трёх. Переход
+  делается до отправки запроса и никогда после отказа сертификата (прокси или сайта) или запроса пароля прокси.
+  Сработавший адрес пробуется первым до конца работы процесса; на диск он не записывается.
 - Маршрут выбирается так: `rutracker-proxy.txt` (одна строка `https://ps1.blockme.site:443` или
   `http://127.0.0.1:<порт>`), иначе прокси Windows, если он задан, иначе прямое соединение. Через этот маршрут идут
   только вход на rutracker.org и скачивание `.torrent`. µTorrent, WebTLO, Firefox, остальные программы, DNS,
@@ -85,6 +102,7 @@ Windows PowerShell 5.1 сами HTTPS-прокси не поддерживают
   - `RuTrackerUnavailable` — сайт недоступен напрямую, нужен прокси;
   - `RuTrackerProxyUnavailable` — прокси не отвечает, требует пароль или не открыл туннель;
   - `RuTrackerTlsFailed` — ошибка TLS или сертификата;
+  - `RuTrackerTlsComponentInvalid` — нет папки `lib\bouncycastle` рядом со скриптами или её файл изменён;
   - `RuTrackerBlocked` — сайт ответил 403 или 429;
   - `RuTrackerRedirectRefused` — перенаправление за пределы `https://rutracker.org/forum/`.
 - Перенаправления не выполняются автоматически. Ответ на вход не открывается вообще: cookie сессии приходит вместе
@@ -95,33 +113,54 @@ Windows PowerShell 5.1 сами HTTPS-прокси не поддерживают
 (`12-…`), но до развёртывания автозагрузку можно и выключить: `C:\TorrentMonitor\7-Disable-autoload.cmd` —
 это решение пользователя.
 
-*A. Тестовая копия*, отдельная папка с этой версией. `C:\TorrentMonitor` и µTorrent не меняются. Команды выполняются
-в PowerShell в папке копии:
-1. Маршрут:
-   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1`
-   Нужна строка `https://ps1.blockme.site:443 (официальный прокси RuTracker…): РАБОТАЕТ`.
-2. Записать маршрут в копию:
+*A. Тестовая копия* — новая папка с этой версией, например `C:\TorrentControl-p0-tls13-test`; рядом со скриптами
+должна быть папка `lib`. `C:\TorrentMonitor`, µTorrent, Windows, DNS, VPN и Hiddify не меняются. Команды выполняются
+в PowerShell в папке копии, по одной:
+1. Снимок рабочей установки до проверки:
+   `Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.json,*.xml | Get-FileHash | Select-Object Path,Hash | Export-Csv $env:TEMP\tm-before.csv -NoTypeInformation`
+2. Маршрут с TLS 1.3 и запись его в копию:
    `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy https://ps1.blockme.site:443 -Save`
-3. `.\9-RuTracker-login.cmd`: вход, затем «ПРОВЕРКА ПРОЙДЕНА» и сервер статистики. Скрипт скачивает персональный
-   `.torrent` текущей темы ленты и сверяет infohash, но ничего не добавляет в µTorrent.
+   Нужна строка `https://ps1.blockme.site:443 (указан в команде): РАБОТАЕТ (HTTP 200, TLS 1.3, сертификат rutracker.org в порядке); адрес прокси …`
+   и `Записано в rutracker-proxy.txt`.
+3. `.\9-RuTracker-login.cmd`: проверка маршрута ещё до запроса пароля, окно Windows для логина и пароля RuTracker
+   (CAPTCHA, если сайт попросит, вводится вручную), затем «ПРОВЕРКА ПРОЙДЕНА … скачан с RuTracker» и сервер
+   статистики. Скрипт скачивает персональный `.torrent` текущей темы ленты, для которой файла ещё нет, сверяет
+   infohash и сохраняет его в `%LOCALAPPDATA%\TorrentControl\personal`; в µTorrent ничего не добавляется.
+   Пароль и cookie хранятся в папке копии (DPAPI этого пользователя Windows), в консоль не выводятся.
+4. Трекеры полученного файла без вывода ключа — команда из п. 6 «Проверки на реальном ПК» ниже: `Personal` ≥ 1,
+   `Public` = 0, `Other` = 0.
+5. Рабочая установка не изменилась:
+   `Compare-Object (Import-Csv $env:TEMP\tm-before.csv) (Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.json,*.xml | Get-FileHash | Select-Object Path,Hash) -Property Path,Hash`
+   — пустой вывод (если между снимками прошёл плановый опрос, изменятся только `state.json` и `auto-state.json`
+   самой версии 1.8).
 
-*B. Рабочая установка*, только после разрешения:
-1. Резервная копия: `Copy-Item C:\TorrentMonitor C:\TorrentMonitor-backup-1.8 -Recurse`
+*B. Рабочая установка* — только после успешной проверки A и отдельного разрешения:
+1. Резервная копия всей папки: `Copy-Item C:\TorrentMonitor C:\TorrentMonitor-backup-1.8 -Recurse`
 2. Делать сразу после очередного опроса:
    `Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Select-Object LastRunTime, NextRunTime, LastTaskResult`
-3. Скопировать только программу и маршрут из папки копии. `config.json`, `credential.xml`, `state.json` и
-   `auto-state.json` не затрагиваются:
+3. Скопировать только программу, папку `lib` и маршрут. `config.json`, `credential.xml`, `state.json`,
+   `auto-state.json`, `autoload.json` и журналы не затрагиваются, торренты и µTorrent тоже:
    `Copy-Item .\*.ps1, .\*.cs, .\*.cmd, .\README.md, .\README.txt, .\rutracker-proxy.txt -Destination C:\TorrentMonitor -Force`
-4. В `C:\TorrentMonitor` выполнить `9-RuTracker-login.cmd` под тем же пользователем Windows, под которым работает
-   планировщик.
-5. `2-Run-once.cmd`, затем в `auto-downloads.html` новые фильмы должны быть «Передано клиенту» со столбцом «Трекер»
+   `Copy-Item .\lib -Destination C:\TorrentMonitor -Recurse -Force`
+4. Проверить библиотеку: `Get-FileHash C:\TorrentMonitor\lib\bouncycastle\2.7.0\net461\BouncyCastle.Cryptography.dll`
+   → `4F96977E9C67334742C683410B3A361258219F0D3084A5E0BC10FBA96CF23A0D` (при другом значении скрипты сами
+   откажутся работать с RuTracker: `RuTrackerTlsComponentInvalid`).
+5. В `C:\TorrentMonitor` выполнить `9-RuTracker-login.cmd` под тем же пользователем Windows, под которым работает
+   планировщик (или, если это тот же пользователь, что в п. A3, скопировать из копии `rutracker-credential.xml`,
+   `rutracker-session.xml`, `rutracker-state.json` и запустить `10-RuTracker-check.cmd`).
+6. `2-Run-once.cmd`, затем в `auto-downloads.html` новые фильмы должны быть «Передано клиенту» со столбцом «Трекер»
    `bt2.rutracker.cx` или «Ожидает авторизацию RuTracker» с причиной.
-6. В µTorrent у новой раздачи трекер `bt2.rutracker.cx` должен быть в статусе «работает», а в профиле RuTracker
+7. В µTorrent у новой раздачи трекер `bt2.rutracker.cx` должен быть в статусе «работает», а в профиле RuTracker
    отдача должна засчитываться.
 
-*Откат:* `Copy-Item C:\TorrentMonitor-backup-1.8\*.ps1, C:\TorrentMonitor-backup-1.8\*.cs, C:\TorrentMonitor-backup-1.8\*.cmd -Destination C:\TorrentMonitor -Force`.
-Журналы совместимы. Записи «Ожидает авторизацию RuTracker» версия 1.8 просто не обрабатывает. Новые файлы
-`rutracker-*` она не читает.
+*Откат* — только программа; данные новой версии остаются на месте:
+`Copy-Item C:\TorrentMonitor-backup-1.8\*.ps1, C:\TorrentMonitor-backup-1.8\*.cs, C:\TorrentMonitor-backup-1.8\*.cmd, C:\TorrentMonitor-backup-1.8\README.* -Destination C:\TorrentMonitor -Force`
+- `auto-state.json`, `state.json`, `config.json`, `credential.xml` и `autoload.json` из резервной копии **не**
+  возвращать: в `auto-state.json` записаны раздачи, уже переданные новой версией, и это защита от повторной отправки.
+  Журналы совместимы; записи «Ожидает авторизацию RuTracker» версия 1.8 просто не обрабатывает.
+- Торренты в µTorrent, их трекеры и файлы на D: откат не затрагивает.
+- Файлы, которых нет в 1.8 (`RuTrackerTls13.*`, папка `lib`, `rutracker-*`, новые `.cmd`), версия 1.8 не читает;
+  их можно оставить. Список: `Get-ChildItem C:\TorrentMonitor | Where-Object { !(Test-Path (Join-Path C:\TorrentMonitor-backup-1.8 $_.Name)) }`.
 
 **Hiddify** (по исходному коду клиента `hiddify-app` / `hiddify-core`). Локальный порт — это sing-box `mixed`
 (HTTP и SOCKS на одном порту) на `127.0.0.1`. Он открыт в режимах «Только прокси» и «Установить системный прокси».
@@ -141,7 +180,8 @@ Windows PowerShell 5.1 сами HTTPS-прокси не поддерживают
 `Test-RuTrackerConnection.ps1` (запускается из `15-RuTracker-connection.cmd`) проверяет:
 - DNS и прямое HTTPS;
 - прокси из `rutracker-proxy.txt`, прокси Windows и найденные порты Hiddify;
-- для каждого прокси: соединение, CONNECT, TLS и ответ сайта.
+- для каждого прокси: соединение, CONNECT, TLS и ответ сайта. В строке «РАБОТАЕТ» указаны версия TLS
+  с `rutracker.org`, адрес прокси, через который прошла проверка, и сколько адресов пробовалось.
 
 Причину отказа он объясняет понятным текстом и сохраняет отчёт в `rutracker-connection.txt`. Логин, пароль, cookie
 и адреса трекеров он не читает и не использует. Параметры: `-Proxy http://127.0.0.1:<порт>`, `-FindLocalProxy`,
@@ -420,7 +460,8 @@ Atom содержит `updated`, а не `published`: впервые замеч�
 - «Ожидает место» — не хватает места с учётом запаса и незавершённых заданий.
 - «Ожидает авторизацию RuTracker» — персональный `.torrent` не получен (причина в журнале); публичная версия не
   добавляется. При сетевых кодах (`RuTrackerUnavailable`, `RuTrackerProxyUnavailable`, `RuTrackerTlsFailed`)
-  запустите `15-RuTracker-connection.cmd`, иначе обычно помогает `9-RuTracker-login.cmd`;
+  запустите `15-RuTracker-connection.cmd`; при `RuTrackerTlsComponentInvalid` скопируйте папку `lib` из той же
+  версии; иначе обычно помогает `9-RuTracker-login.cmd`;
   проверка — `10-RuTracker-check.cmd`.
 - «Передано клиенту» — ждём появления хеша и пути в WebUI/resume.dat. Повторной передачи не будет.
 - «Нужна проверка» — проверьте задание и путь в µTorrent; следующие добавления блокируются.
@@ -449,7 +490,16 @@ Atom содержит `updated`, а не `published`: впервые замеч�
 повреждённые файлы отклоняются, секреты не попадают в отчёты, перепривязка вызывает только `getprops`/`setprops trackers`
 и не трогает ручные раздачи, файлы и пути. Раннер также проверяет, что настоящая папка `%LOCALAPPDATA%\TorrentControl` не изменилась.
 
-Автотесты `tests\Run-All.ps1` выполняются в GitHub Actions на Windows PowerShell 5.1 и PowerShell 7 для каждого PR:
+Транспорт к RuTracker проверяется настоящими TLS-соединениями (`tests\Test-RuTrackerTls.ps1`): поддельные прокси
+на `127.0.0.x` играют роль HTTPS-прокси и `rutracker.org` с TLS 1.3 и одноразовыми тестовыми сертификатами.
+Проверяются анонимная проверка маршрута, вход, скачивание персонального `.torrent` до сохранения файла, истёкшая
+сессия, отказ для чужого infohash и публичного `.torrent`, переход между адресами прокси и отказы сертификатов
+(недоверенный корень, чужое имя, просроченный и ещё не действующий, без назначения «сервер», чужое имя у прокси);
+во всех отказах пароль и cookie не отправляются. Тестовый корень нигде не устанавливается: в Linux ему доверяет
+только дочерний процесс через `SSL_CERT_FILE`, поэтому успешные сценарии выполняются в задании Linux, а отказы — везде.
+
+Автотесты `tests\Run-All.ps1` выполняются в GitHub Actions на Windows PowerShell 5.1, PowerShell 7 и PowerShell 7
+в Linux для каждого PR:
 анализ спроса, защита истории, гонки и восстановление автозагрузки, расчёт места на D:, проверки копии ленты
 (свежесть, откат, разрывы, диагностика), разбор `resume.dat` и `.torrent`, а также отсутствие в коде удаления данных
 и изменяющих действий WebUI. Скрипты зеркала проверяются отдельно: `python3 -m unittest discover -s tests -p "test_*.py"`.

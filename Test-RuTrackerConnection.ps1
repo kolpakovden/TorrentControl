@@ -2,7 +2,8 @@
 # Diagnosis of the network route from this computer to RuTracker for TorrentControl (15-RuTracker-connection.cmd).
 # Read-only for the computer: no DNS, route, registry, VPN, browser or Windows proxy setting is changed, Hiddify is
 # neither started nor configured. Every check is anonymous: no login, password, cookie or tracker address is used,
-# only the status line of https://rutracker.org/forum/index.php is read (RuTrackerRoute.cs, certificate validated).
+# only the status line of https://rutracker.org/forum/index.php is read (RuTrackerRoute.cs; TLS 1.3 with the site by
+# RuTrackerTls13.cs, certificate validated by Windows for rutracker.org).
 #   -Proxy http://127.0.0.1:PORT  check this proxy (http:// or https://, for example the proxy port of Hiddify);
 #   (default)                     also check the official RuTracker proxy https://ps1.blockme.site:443 - the route the
 #                                 official RuTracker extension of Firefox uses on this computer; -NoOfficialProxy skips it;
@@ -24,8 +25,8 @@ $script:RouteTexts = @{
     ProxyAuthRequired = 'прокси требует пароль (HTTP 407); TorrentControl не хранит пароли прокси — нужен порт без авторизации'
     ProxyRefused = 'прокси не открыл туннель к rutracker.org:443 (ответ {0}); возможно, это не HTTP-прокси'
     Timeout = 'нет ответа за {1} с (этап: {2})'
-    TlsFailed = 'защищённое соединение (TLS) не установлено: соединение оборвано или подменено'
-    TlsCertificateInvalid = 'сертификат rutracker.org не прошёл проверку ({3}); соединение прервано, ничего не отправлено'
+    TlsFailed = 'защищённое соединение (TLS) с rutracker.org не установлено{3}: соединение оборвано или подменено'
+    TlsCertificateInvalid = 'сертификат rutracker.org не прошёл проверку{3}; соединение прервано, ничего не отправлено'
     HttpForbidden = 'rutracker.org ответил 403 — доступ с этого адреса выхода запрещён'
     HttpRateLimited = 'rutracker.org ответил 429 — слишком много запросов, повторите позже'
     HttpUnexpected = 'неожиданный ответ rutracker.org (HTTP {4})'
@@ -37,10 +38,12 @@ function Format-RouteResult($Result, [int]$TimeoutSec) {
     # No answer while connecting to the proxy has the same practical causes as a refused connection.
     if ($Result.Code -eq 'Timeout' -and $Result.Stage -eq 'ProxyConnect') { $template = $script:RouteTexts.ProxyUnreachable + ' (нет ответа за {1} с)' }
     if (!$template) { $template = 'ошибка ({0})' }
+    # Fixed texts only (SslPolicyErrors, chain status and TLS alert names), never a URL, cookie or key.
     $tlsErrors = [string]$Result.TlsErrors
-    if ($Result.Code -eq 'ProxyTlsFailed' -and $tlsErrors) { $tlsErrors = ' (' + $tlsErrors + ')' }
+    if ($tlsErrors) { $tlsErrors = ' (' + $tlsErrors + ')' }
     $text = $template -f $Result.ProxyStatus, $TimeoutSec, $script:StageTexts[[string]$Result.Stage], $tlsErrors, $Result.HttpStatus
-    if ($Result.Ok) { $text += ' (HTTP ' + $Result.HttpStatus + ', TLS и сертификат в порядке)' }
+    if ($Result.Ok) { $text += ' (HTTP ' + $Result.HttpStatus + ', ' + $Result.TlsVersion + ', сертификат rutracker.org в порядке)' }
+    if ([int]$Result.Attempts -gt 0) { $text += '; адрес прокси ' + $Result.Endpoint + ', попыток ' + $Result.Attempts + ' из ' + $Result.Addresses }
     return ($text + ', ' + [math]::Round($Result.ElapsedMs / 1000.0, 1).ToString([Globalization.CultureInfo]::InvariantCulture) + ' с')
 }
 function Get-ListeningSockets {
@@ -141,7 +144,7 @@ function Save-RuTrackerProxy([string]$Directory, [string]$Url) {
 
 if ($MyInvocation.InvocationName -ne '.') {
     try {
-        $report = Invoke-RuTrackerDiagnostics $PSScriptRoot $Proxy -FindLocalProxy:$FindLocalProxy $TimeoutSec
+        $report = Invoke-RuTrackerDiagnostics $PSScriptRoot $Proxy -FindLocalProxy:$FindLocalProxy $TimeoutSec -NoOfficialProxy:$NoOfficialProxy
         foreach ($line in $report.lines) { Write-Host $line }
         [IO.File]::WriteAllLines((Join-Path $PSScriptRoot 'rutracker-connection.txt'), [string[]]$report.lines, (New-Object Text.UTF8Encoding($true)))
         if ($report.working -and $report.working -ne $report.configured) {
@@ -152,7 +155,10 @@ if ($MyInvocation.InvocationName -ne '.') {
         if ($report.directOk -or $report.working) { exit 0 }
         exit 2
     } catch {
-        Write-Host ('Проверка остановлена: ' + (Get-RuTrackerCode $_.Exception)) -ForegroundColor Red
+        $code = Get-RuTrackerCode $_.Exception
+        $hint = ''
+        if ($code -eq 'RuTrackerTlsComponentInvalid') { $hint = ' — нет папки lib\bouncycastle рядом со скриптами или её файл изменён (SHA-256 не совпал); скопируйте папку lib из той же версии' }
+        Write-Host ('Проверка остановлена: ' + $code + $hint) -ForegroundColor Red
         exit 1
     }
 }
