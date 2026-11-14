@@ -6,6 +6,28 @@ TORRENTCONTROL 1.8
 а также autoload.json, auto-state.json и файлы *.json.bak, если они уже существуют.
 1-Setup.cmd и 6-Enable-autoload.cmd при обновлении с 1.7 повторно запускать не нужно.
 
+СТАТИСТИКА RUTRACKER (ВАЖНО)
+Раньше автозагрузка добавляла .torrent с публичным адресом трекера без ключа,
+поэтому отдача не начислялась в профиль. Теперь в uTorrent передаётся только
+персональный .torrent, скачанный этим компьютером под вашей учётной записью.
+9-RuTracker-login.cmd — вход (под пользователем Windows, от имени которого работает монитор).
+10-RuTracker-check.cmd — проверка получения персонального .torrent.
+Без входа новые фильмы ждут авторизации; публичная версия не добавляется.
+Если rutracker.org напрямую не открывается: 15-RuTracker-connection.cmd проверит маршрут официального
+расширения RuTracker (HTTPS-прокси ps1.blockme.site:443, как в Firefox) и локальный прокси Hiddify
+и после ввода YES запишет рабочий в rutracker-proxy.txt.
+Прокси используется только для запросов TorrentControl к RuTracker; настройки Windows не меняются.
+Пароль и cookie зашифрованы DPAPI; на GitHub не передаются.
+Если TorrentControl не достаёт до RuTracker, а Firefox может: скачайте персональный .torrent в Firefox и
+импортируйте 16-Import-personal-torrent.cmd (без сети; файл сверяется с auto-state.json по hash).
+17-Check-personal-migration.cmd -List — старые раздачи и ссылки; -Topic N — Dry Run одной раздачи
+(µTorrent только читается). Команды для тестовой копии — README.md.
+Уже скачанные раздачи, без повторной загрузки, строго по порядку:
+11-Tracker-migration-dry-run.cmd — Dry Run, ничего не меняет (tracker-migration.html);
+12-Tracker-migration-one.cmd — одна раздача с подтверждением;
+проверить трекер в uTorrent и начисление в профиле RuTracker (README.md);
+13-Tracker-migration-verified.cmd — отметить проверку; 14-Tracker-migration-batch.cmd — остальные.
+
 АВТОЗАГРУЗКА
 6-Enable-autoload.cmd — включить. Первый запуск исключает текущую подборку.
 2-Run-once.cmd — проверить сейчас; далее работает прежнее расписание каждые 15 минут.

@@ -5,6 +5,7 @@ $root = $PSScriptRoot
 . "$root\LocalPaths.ps1"
 . "$root\Feed.ps1"
 . "$root\AutoLoad.ps1"
+. "$root\RuTracker.ps1"
 function Save-Json($Value, $Path) { Save-AutoJson $Value $Path }
 function Get-MonitorErrorCode($Exception) {
     # Fixed codes only; never log response bodies, tokens or URLs.

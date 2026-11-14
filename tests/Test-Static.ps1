@@ -18,15 +18,125 @@ foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.cmd')) {
 }
 
 # --- Production code never deletes data, changes client settings or acts on torrents via WebUI -------
+# One exception, in TrackerMigration.ps1 only: reading a torrent's properties and replacing its tracker list.
+$allowedWebUI = @{
+    'TrackerMigration.ps1' = @("'&action=getprops&hash=' + `$Hash", "'&action=setprops&hash=' + `$Hash + '&s=trackers&v=' + [uri]::EscapeDataString(`$Trackers)")
+}
 foreach ($file in @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extension -in @('.ps1', '.cs') })) {
     $text = [IO.File]::ReadAllText($file.FullName)
-    foreach ($pattern in @('Remove-Item', '::Delete\(', '\.Delete\(', 'removedata', 'setsetting', 'setprops', 'action=(?!getsettings\b)')) {
+    if ($allowedWebUI.ContainsKey($file.Name)) {
+        foreach ($allowed in $allowedWebUI[$file.Name]) {
+            Assert (([regex]::Matches($text, [regex]::Escape($allowed))).Count -eq 1) "$($file.Name): expected exactly one '$allowed'"
+            $text = $text.Replace($allowed, '')
+        }
+    }
+    if ($file.Extension -eq '.ps1') { $text = [regex]::Replace($text, '(?m)^\s*#.*$', '') }   # whole-line comments may describe what is forbidden
+    foreach ($pattern in @('Remove-Item', '::Delete\(', '\.Delete\(', 'removedata', 'setsetting', 'setprops', 'getprops', 'action=(?!getsettings\b)', 'Move-Item', 'recheck', 'setlabel')) {
         Assert ($text -notmatch $pattern) "$($file.Name) contains forbidden operation '$pattern'"
     }
 }
 
+# --- P0: personal RuTracker .torrent, secrets stay on this computer ----------------------------------
+$production = @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extension -in @('.ps1', '.cs', '.cmd') })
+foreach ($file in $production) {
+    $text = [IO.File]::ReadAllText($file.FullName)
+    # Browser cookie stores are never read; the session comes only from the person's own login in Setup-RuTracker.ps1.
+    foreach ($pattern in @('(?i)cookies\.sqlite', '(?i)Network\\Cookies', '(?i)Login Data', '(?i)\\User Data\\', '(?i)Mozilla\\Firefox', '(?i)ProtectedData\]::Unprotect')) {
+        Assert ($text -notmatch $pattern) "$($file.Name) touches browser data: '$pattern'"
+    }
+    Assert ($text -notmatch 'api\.github\.com') "$($file.Name): the local client never writes to GitHub"
+    if ($file.Name -ne 'RuTracker.ps1') {
+        # PersonalImport.ps1 only shows the download link to the person (opened in Firefox), it never requests it.
+        if ($file.Name -eq 'PersonalImport.ps1') { $text = $text.Replace("download = 'https://rutracker.org/forum/dl.php?t=' + `$Topic", '') }
+        Assert ($text -notmatch "(?i)'Post'|-Method\s+Post|login\.php|dl\.php|login_password") "$($file.Name) talks to RuTracker outside RuTracker.ps1"
+    }
+}
+foreach ($name in @('AutoLoad.ps1', 'TorrentMetadata.cs', 'TrackerMigration.ps1', 'Setup-RuTracker.ps1')) {
+    # The public magnet announce is only recognised (RuTracker.ps1), never written into a torrent.
+    $path = Join-Path $repo $name
+    if (Test-Path -LiteralPath $path) { Assert ([IO.File]::ReadAllText($path) -notmatch 'ann\?magnet|https?://[^\s''"]*t-ru\.org') "$name contains the public announce" }
+}
+$ru = [IO.File]::ReadAllText((Join-Path $repo 'RuTracker.ps1'))
+$hosts = @([regex]::Matches([regex]::Replace($ru, '(?m)^\s*#.*$', '').Replace('\.', '.'), 'https?://[A-Za-z0-9.-]+') | ForEach-Object { $_.Value } | Select-Object -Unique)
+Assert (@($hosts | Where-Object { $_ -notin @('https://rutracker.org', 'http://bt.t-ru.org', 'https://static.rutracker.cc', 'https://ps1.blockme.site') }).Count -eq 0) "RuTracker.ps1 addresses: $($hosts -join ', ')"
+Assert ($ru -match [regex]::Escape("Join-Path `$env:LOCALAPPDATA 'TorrentControl\personal'")) 'personal torrents must live in the Windows profile'
+# Only confirmed RuTracker tracker domains count as personal; widening the list needs a real file as evidence.
+Assert ($ru -match [regex]::Escape("`$script:RuTrackerTrackerDomains = @('t-ru.org', 'rutracker.cx', 'rutracker.org')")) 'RuTracker tracker domains changed without review'
+Assert ($ru -match [regex]::Escape("`$script:NeutralTrackerHosts = @('retracker.local')")) 'neutral tracker list changed without review'
+# --- Network access to RuTracker: only TorrentControl's own requests, nothing on the computer changes ---------
+foreach ($file in $production) {
+    $text = [regex]::Replace([IO.File]::ReadAllText($file.FullName), '(?m)^\s*#.*$', '')
+    foreach ($pattern in @('(?i)Set-ItemProperty', '(?i)New-ItemProperty', '(?i)\bnetsh\b', '(?i)Set-DnsClient', '(?i)\broute(\.exe)?\s+(add|change|delete)',
+        '(?i)Add-VpnConnection', '(?i)DefaultWebProxy\s*=', '(?i)\breg(\.exe)?\s+(add|delete)', '(?i)ServerCertificateValidationCallback', '(?i)SkipCertificateCheck',
+        '(?i)CheckCertificateRevocationList', '(?i)AllowAutoRedirect\s*=\s*\$true', '(?i)(Start|Stop)-Process[^\r\n]*(hiddify|sing-?box)', 'http://rutracker')) {
+        Assert ($text -notmatch $pattern) "$($file.Name) changes network settings or weakens TLS: '$pattern'"
+    }
+    if ($file.Name -ne 'RuTrackerRoute.cs') {
+        Assert ($text -notmatch 'RemoteCertificateValidationCallback|SslPolicyErrors') "$($file.Name) handles certificate validation"
+    }
+}
+$route = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerRoute.cs'))
+Assert (([regex]::Matches($route, 'new SslStream\(')).Count -eq 1 -and $route -match [regex]::Escape('{ seen = errors; return errors == SslPolicyErrors.None; }')) 'RuTrackerRoute.cs must accept only certificates without errors'
+Assert ($route -match [regex]::Escape('"CONNECT " + host + ":" + port + " HTTP/1.1') -and $route -match [regex]::Escape('stream = Authenticate(stream, proxyHost, true);')) 'the route must use HTTP CONNECT and validate an https proxy like the site'
+Assert ($route -notmatch 'HttpWebRequest|HttpClient|WebClient|AllowAutoRedirect') 'RuTrackerRoute.cs is the only transport and never follows redirects'
+Assert (([regex]::Matches($ru, [regex]::Escape('[RuTrackerRoute]::Send('))).Count -eq 1 -and $ru -notmatch 'Invoke-WebRequest|WebRequest\]::Create|HttpClient|Net\.WebProxy') 'RuTracker requests must go through RuTrackerRoute.cs only'
+Assert ($ru -match '(?s)function Get-PersonalTorrent.*?Assert-RuTrackerRoute.*?Read-RuTrackerSessionText' -and $ru -match '(?s)function Invoke-RuTrackerLogin.*?Assert-RuTrackerRoute.*?login_password') 'route must be checked before a cookie or password is sent'
+$diagnostics = [IO.File]::ReadAllText((Join-Path $repo 'Test-RuTrackerConnection.ps1'))
+foreach ($pattern in @('Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Import-Clixml', 'Invoke-RuTrackerLogin', 'Get-PersonalTorrent', 'Invoke-RuTrackerHttp', 'Start-Process', 'Stop-Process', 'Set-Content', 'Out-File')) {
+    Assert ($diagnostics -notmatch $pattern) "Test-RuTrackerConnection.ps1 must stay anonymous and read-only: '$pattern'"
+}
+
+# --- TLS 1.3 component: strict certificate validation, library loaded only from verified bytes ---------------
+$tls13 = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerTls13.cs'))
+foreach ($required in @('if (!x509.Build(leaf))', 'x509.ChainPolicy.VerificationFlags = X509VerificationFlags.NoFlag;', 'ApplicationPolicy.Add(new Oid("1.3.6.1.5.5.7.3.1"))',
+    'throw new TlsFatalAlert(AlertDescription.bad_certificate);', 'if (!NameInCertificate(leafBytes, owner.ExpectedName))', 'CertificateCheck.Validate(serverCertificate == null ? null : serverCertificate.Certificate, owner)')) {
+    Assert ($tls13.Contains($required)) "RuTrackerTls13.cs lost a validation step: $required"
+}
+Assert ($tls13 -notmatch 'AllowUnknownCertificateAuthority|IgnoreInvalidName|IgnoreNotTimeValid|IgnoreWrongUsage|X509VerificationFlags\.All|AllFlags|CustomTrustStore|TrustMode|ChainPolicy\.CustomTrust') 'RuTrackerTls13.cs relaxes certificate validation'
+$loader = [IO.File]::ReadAllText((Join-Path $repo 'RuTrackerTls13.ps1'))
+Assert ($loader -match [regex]::Escape('if ($hash -ne $entry.sha256) { throw ''TlsLibraryInvalid'' }') -and $loader -match [regex]::Escape('[Reflection.Assembly]::Load($bytes)') -and $loader -notmatch 'LoadFrom|LoadFile|UnsafeLoadFrom|Unblock-File') 'the TLS library must be loaded only from SHA-256-verified bytes'
+$libFiles = @(Get-ChildItem -LiteralPath (Join-Path $repo 'lib') -Recurse -File | ForEach-Object { $_.FullName.Substring($repo.Length + 1).Replace('\', '/') } | Sort-Object)
+Assert (($libFiles -join ',') -eq 'lib/bouncycastle/2.7.0/LICENSE.md,lib/bouncycastle/2.7.0/net461/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/net6.0/BouncyCastle.Cryptography.dll,lib/bouncycastle/2.7.0/SOURCE.txt') "unexpected files in lib: $($libFiles -join ', ')"
+
+# --- Import of personal .torrent files and the Dry Run: offline, read-only for uTorrent and C:\TorrentMonitor -----
+foreach ($name in @('PersonalImport.ps1', 'Import-PersonalTorrent.ps1', 'Test-PersonalMigration.ps1')) {
+    $text = [regex]::Replace([IO.File]::ReadAllText((Join-Path $repo $name)), '(?m)^\s*#.*$', '')
+    foreach ($pattern in @('Invoke-RuTrackerHttp', 'Invoke-RuTrackerRouteCheck', 'Read-RuTrackerCredential', 'Read-RuTrackerSessionText', 'Invoke-RuTrackerLogin',
+        'Get-PersonalTorrent\s', 'setprops', 'Export-Clixml', 'Set-Content', 'Out-File', 'Add-Content', 'Save-AutoJson', 'Start-Process', 'Set-Acl', 'Invoke-WebRequest')) {
+        Assert ($text -notmatch $pattern) "$name must stay offline and read-only: '$pattern'"
+    }
+    foreach ($write in [regex]::Matches($text, '\[IO\.File\]::Write\w+\(([^,]+)')) {
+        Assert ($write.Groups[1].Value -match '^\(Join-Path \$(ReportDirectory|PSScriptRoot) ') "$name writes outside its report folder: $($write.Value)"
+    }
+}
+$check = [IO.File]::ReadAllText((Join-Path $repo 'Test-PersonalMigration.ps1'))
+Assert ($check -match [regex]::Escape("function Set-WebUITrackers { throw 'ReadOnlyViolation' }") -and $check -match [regex]::Escape("function Invoke-TrackerMigration { throw 'ReadOnlyViolation' }")) 'the Dry Run must disable the changing migration functions'
+Assert ($ru -match '(?s)function Get-PersonalTorrent\(.*?Get-ImportedPersonalTorrent.*?Resolve-RuTrackerProxy.*?Read-RuTrackerCredential.*?Assert-RuTrackerRoute') 'a verified local file must be used before any network step'
+Assert ($ru -match '(?s)function Save-PersonalTorrentBytes.*?Test-PersonalTorrent \$temp.*?Replace\(\$temp, \$final') 'a personal file must be verified before it replaces the stored one'
+foreach ($file in $production) {
+    if ($file.Name -ne 'RuTracker.ps1') { Assert ([IO.File]::ReadAllText($file.FullName) -notmatch 'Set-Acl') "$($file.Name) changes permissions" }
+}
+Assert (([regex]::Matches($ru, 'Set-Acl')).Count -eq 1 -and $ru -match '(?s)function Protect-PersonalTorrentDirectory.*?Set-Acl -LiteralPath \$Folder') 'permissions are changed only for the personal folder'
+
+# Raw exception texts (which could quote a URL with a key) are never written to the console, logs or reports.
+foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.ps1')) {
+    foreach ($line in [IO.File]::ReadAllLines($file.FullName)) {
+        if ($line -match 'Exception\.Message' -and $line -match 'Write-Host|Write-Output|Add-Content|Set-Content|Out-File|ConvertTo-Html') {
+            Assert $false "$($file.Name) writes a raw exception message: $($line.Trim())"
+        }
+    }
+}
+$ignored = [IO.File]::ReadAllText((Join-Path $repo '.gitignore'))
+foreach ($name in @('rutracker-credential.xml', 'rutracker-session.xml', 'rutracker-state.json', 'tracker-migration.json', 'tracker-migration.html', 'tracker-migration.csv', 'credential.xml')) {
+    Assert ($ignored -match ('(?m)^' + [regex]::Escape($name) + '\s*$')) "$name is not in .gitignore"
+}
+# The GitHub side (Actions, cache, feed) never logs in to RuTracker or handles personal files.
+foreach ($file in @(Get-ChildItem -LiteralPath (Join-Path $repo 'scripts') -File) + @(Get-ChildItem -LiteralPath (Join-Path $repo '.github\workflows') -File)) {
+    Assert ([IO.File]::ReadAllText($file.FullName) -notmatch '(?i)login\.php|dl\.php|bb_session|login_password|passkey|personal') "$($file.Name) handles RuTracker accounts"
+}
+
 # --- C# helpers compile with this runtime's compiler (C# 5 under Windows PowerShell 5.1) -----------
-foreach ($type in @('ResumePaths', 'TorrentMetadata')) {
+foreach ($type in @('ResumePaths', 'TorrentMetadata', 'RuTrackerRoute')) {
     if (!($type -as [type])) { Add-Type -Path (Join-Path $repo "$type.cs") }
     Assert ($type -as [type]) "$type did not compile"
 }
@@ -78,9 +188,20 @@ try {
     [IO.File]::WriteAllBytes($fixture, [Convert]::FromBase64String('ZDQ6aW5mb2Q2Omxlbmd0aGk1OGU0Om5hbWUyODpUb3JyZW50Q29udHJvbC1wYXRoLXRlc3QudHh0MTI6cGllY2UgbGVuZ3RoaTE2Mzg0ZTY6cGllY2VzMjA6fif7fCP8oPWUPlhooe+04CEImto3OnByaXZhdGVpMWVlZQ=='))
     Assert ([TorrentMetadata]::Verify($fixture, '51CE70C03EC2FBF311F03C4B6570951C3CF28F3A') -eq 58) 'fixture size'
     Assert-Throws { [TorrentMetadata]::Verify($fixture, ('0' * 40)) } $null 'infohash mismatch accepted'
-    [TorrentMetadata]::Sanitize($fixture, '51CE70C03EC2FBF311F03C4B6570951C3CF28F3A')
-    Assert ([Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($fixture)) -like 'd8:announce29:http://bt.t-ru.org/ann?magnet4:info*') 'tracker replaced by the known public one'
-    Assert ([TorrentMetadata]::Verify($fixture, '51CE70C03EC2FBF311F03C4B6570951C3CF28F3A') -eq 58) 'sanitized torrent keeps the infohash'
+    # P0: the client never rewrites trackers (the old Sanitize put the public magnet announce into every file).
+    Assert ($null -eq [TorrentMetadata].GetMethod('Sanitize')) 'tracker rewriting is back'
+    Assert (@([TorrentMetadata]::ReadTrackers($fixture)).Count -eq 0) 'fixture has no trackers'
+    $personalFile = Join-Path $temp 'personal.torrent'
+    $tiers = @(@('http://bt4.rutracker.cc/ann?kk=FAKE01'), @('http://retracker.local/announce', 'http://bt4.rutracker.cc/ann?kk=FAKE01'))
+    $fileBytes = ConvertTo-Bencode ([ordered]@{ announce = 'http://bt4.rutracker.cc/ann?kk=FAKE01'; 'announce-list' = @(foreach ($t in $tiers) { ,@($t) }); info = $good0 = [ordered]@{ length = 5; name = 'f.mkv'; 'piece length' = 16384; pieces = (New-Object byte[] 20) } })
+    [IO.File]::WriteAllBytes($personalFile, $fileBytes)
+    $read = @([TorrentMetadata]::ReadTrackers($personalFile))
+    Assert ($read.Count -eq 2 -and $read[1].Count -eq 2 -and $read[1][1] -eq 'http://bt4.rutracker.cc/ann?kk=FAKE01') 'announce-list tiers read as stored'
+    Assert ((Get-Sha1Hex ([IO.File]::ReadAllBytes($personalFile))) -eq (Get-Sha1Hex $fileBytes)) 'reading trackers changed the file'
+    [IO.File]::WriteAllBytes($personalFile, (ConvertTo-Bencode ([ordered]@{ announce = 'http://bt2.rutracker.cx/ann?kk=FAKE01'; info = $good0 })))
+    Assert (@([TorrentMetadata]::ReadTrackers($personalFile))[0][0] -eq 'http://bt2.rutracker.cx/ann?kk=FAKE01') 'announce without announce-list'
+    [IO.File]::WriteAllBytes($personalFile, (ConvertTo-Bencode ([ordered]@{ announce = "http://bt2.rutracker.cx/ann?kk=FAKE`n01"; info = $good0 })))
+    Assert-Throws { [TorrentMetadata]::ReadTrackers($personalFile) } $null 'tracker with a control character accepted'
     $cases = @(
         @{ why = 'executable payload'; info = [ordered]@{ length = 5; name = 'film.exe'; 'piece length' = 16384; pieces = (New-Object byte[] 20) } },
         @{ why = 'parent directory component'; info = [ordered]@{ files = @([ordered]@{ length = 5; path = @('..', 'x.mkv') }); name = 'Film'; 'piece length' = 16384; pieces = (New-Object byte[] 20) } },

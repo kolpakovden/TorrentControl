@@ -1,6 +1,7 @@
 ﻿. "$PSScriptRoot\TestCommon.ps1"
 . "$PSScriptRoot\..\Rules.ps1"
 . "$PSScriptRoot\..\AutoLoad.ps1"
+. "$PSScriptRoot\..\RuTracker.ps1"
 
 # --- Pure helpers -------------------------------------------------------------------------------------
 Assert (Test-AutoTitle 'Film WEB-DLRip Dub') 'good title'
@@ -126,8 +127,28 @@ try {
         Assert (@($saved.items | Where-Object status -eq 'Submitted').Count -eq 1) 'not saved before launch'
         Assert ($ArgumentList -like ('/DIRECTORY "D:\Фильмы\rt-' + $script:expectTopic + '" *')) "wrong CLI path: $ArgumentList"
         if ($script:failLaunch) { throw 'Simulated launch failure' }
+        # Only a personal .torrent may ever reach uTorrent.
+        $file = [regex]::Match([string]$ArgumentList, '"([^"]+\.torrent)"$').Groups[1].Value
+        $sent = [Text.Encoding]::ASCII.GetString([IO.File]::ReadAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($file)))
+        Assert ($sent -match 'ann\?kk=' -and $sent -notmatch 'ann\?magnet') "public or non-personal torrent submitted: $file"
+        $script:submittedFiles += $file
         $script:launches += $ArgumentList
         if ($script:afterLaunch) { & $script:afterLaunch }
+    }
+    # Personal .torrent stub: the fixture's info (same infohash) with a personal announce and a FAKE key.
+    $script:personalKey = 'FAKE-PERSONAL-KEY-7f3a9c'
+    $personalAnnounce = 'http://bt2.rutracker.cx/ann?kk=' + $script:personalKey
+    $fixtureBytes = [IO.File]::ReadAllBytes($fixture)
+    $script:personalBytes = [byte[]](@([byte]100) + [Text.Encoding]::ASCII.GetBytes('8:announce' + $personalAnnounce.Length + ':' + $personalAnnounce) + $fixtureBytes[1..($fixtureBytes.Length - 1)])
+    $script:personalMode = 'ok'; $script:personalCalls = 0; $script:submittedFiles = @()
+    function Get-PersonalTorrent {
+        param($Directory, $Topic, $Hash)
+        $script:personalCalls++
+        if ($script:personalMode -ne 'ok') { throw $script:personalMode }
+        $path = Join-Path $temp ('personal-' + $Hash + '.torrent')
+        [IO.File]::WriteAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path), $script:personalBytes)
+        $checked = Test-PersonalTorrent $path $Hash
+        return [pscustomobject]@{ path = $path; host = $checked.host; tiers = $checked.tiers; size = $checked.size }
     }
     function Reset-AutoState($Items = @()) {
         Save-AutoJson @{ version = 1; enabledAt = '2026-10-24T00:00:00Z'; knownTopics = @('900000001'); items = @($Items) } $script:stateFile
@@ -374,5 +395,42 @@ try {
 
     Assert ($script:webCalls.Count -eq 0) "WebUI was called directly: $($script:webCalls -join '; ')"
     Assert ($script:launches.Count -eq 3) "exactly three launches expected in the whole run, got $($script:launches.Count)"
+
+    # --- P0: only the personal RuTracker .torrent is added ------------------------------------------------
+    Assert ($script:submittedFiles.Count -eq 3) 'every launch went through the personal .torrent'
+    Assert ((Get-AutoItem).tracker -eq 'bt2.rutracker.cx' -and (Get-AutoItem).trackerKind -eq 'Personal') 'tracker server not recorded'
+    foreach ($name in @('auto-state.json', 'auto-downloads.html')) {
+        Assert ((Get-FileText (Join-Path $temp $name)) -notmatch [regex]::Escape($script:personalKey)) "$name leaks the personal key"
+    }
+    Assert ((Get-FileText (Join-Path $temp 'auto-downloads.html')) -match 'bt2\.rutracker\.cx') 'tracker server not shown in the journal'
+    # Without a working personal .torrent nothing is added: the public version is never used instead.
+    $before = $script:launches.Count
+    foreach ($code in @('RuTrackerNotConfigured', 'RuTrackerCredentialUnreadable', 'RuTrackerProxyInvalid', 'RuTrackerProxyUnavailable', 'RuTrackerTlsFailed', 'RuTrackerBlocked', 'RuTrackerRedirectRefused', 'RuTrackerCaptchaRequired', 'RuTrackerLoginFailed', 'RuTrackerAuthExpired', 'RuTrackerUnavailable', 'PersonalAnnounceMissing', 'PersonalTrackersUnexpected', 'PersonalTorrentInvalid', 'LocalAppDataMissing')) {
+        Reset-AutoState
+        $script:personalMode = $code
+        $message = Run-Auto $new
+        $item = Get-AutoItem
+        Assert ($item.status -eq 'WaitingAuth' -and $item.reason -eq $code -and $script:launches.Count -eq $before) "$code added something: $($item.status)"
+        Assert (!$script:fakeD.ContainsKey('D:\Фильмы\rt-900000002') -and $message -match 'публичная версия не добавляется') "$code created the folder or hid the reason"
+    }
+    Assert ((Get-FileText (Join-Path $temp 'auto-downloads.html')) -match 'Ожидает авторизацию RuTracker') 'waiting state not shown'
+    # Login fixed: the waiting record is added once, never twice.
+    $script:personalMode = 'ok'
+    $null = Run-Auto $new
+    Assert ($script:launches.Count -eq $before + 1 -and (Get-AutoItem).status -eq 'Submitted') 'waiting record not added after login'
+    $null = Run-Auto $new
+    Assert ($script:launches.Count -eq $before + 1) 'personal torrent added twice'
+    # The topic was re-released with another hash: the old version is not added.
+    Reset-AutoState
+    $script:personalMode = 'PersonalHashMismatch'
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'Rejected' -and (Get-AutoItem).reason -eq 'TopicHashChanged' -and $script:launches.Count -eq $before + 1) 'mismatching hash added'
+    # A torrent already in uTorrent is neither fetched from RuTracker nor added.
+    Reset-AutoState
+    $script:personalMode = 'ok'; $calls = $script:personalCalls
+    $script:clientRows = @($other, (New-TestRow $hash 'E:\Archive\Film' -Size 58))
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'Existing' -and $script:personalCalls -eq $calls -and $script:launches.Count -eq $before + 1) 'existing hash fetched or added'
+    Assert ($script:webCalls.Count -eq 0) 'WebUI called directly'
 } finally { Remove-TestDirectory $temp }
 "PASS Test-AutoLoad: $script:AssertCount assertions"
