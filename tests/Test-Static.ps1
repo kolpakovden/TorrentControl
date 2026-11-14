@@ -102,7 +102,7 @@ Assert ($autoText -match '(?s)Test-AutoTimeLeft \$script:AutoItemSeconds.*?Test-
 Assert ($ru -match [regex]::Escape('if ($null -ne $script:AutoRunDeadline -and $script:AutoRunDeadline -lt $script:RuTrackerDeadline) { $script:RuTrackerDeadline = $script:AutoRunDeadline }')) 'RuTracker must respect the run limit'
 Assert ($route -match [regex]::Escape('guard = new Timer(Expire, null, 3L * timeoutMs, System.Threading.Timeout.Infinite);') -and $route -match [regex]::Escape('if (expired) return "Timeout";')) 'a request must end after 3 timeouts at the latest'
 Assert ($ru -match [regex]::Escape('$script:RuTrackerBudgetSeconds = 120') -and ([regex]::Matches($ru, 'Get-RuTrackerTimeout ')).Count -ge 2) 'time budget not applied to every request'
-Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('public const int MaxProxyAddresses = 16;') -and
+Assert ($route -match '(?s)Stream ThroughProxy\(.*?return Secure\(stream, host\);\s*\}' -and $route -match [regex]::Escape('public const int MaxProxyAddresses = 16;') -and $route -match [regex]::Escape('const int MaxAttemptMs = 5000;') -and
     $route -match [regex]::Escape('if (i > 0 && watch.ElapsedMilliseconds + attemptMs > totalMs - timeoutMs) break;')) 'failover attempt must end before the request, bounded by the time of the request'
 # The order of proxy addresses is learned by RuTracker.ps1 (rutracker-proxy-addresses.json), not fixed in code.
 Assert ($ru -match [regex]::Escape("addresses = Join-Path `$Directory 'rutracker-proxy-addresses.json'") -and $ru -match [regex]::Escape('$hints.preferred, $hints.avoid)') -and $route -notmatch 'LastGood') 'proxy address order must come from the learned state'

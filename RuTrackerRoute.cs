@@ -243,8 +243,10 @@ public static class RuTrackerRoute {
         // use up the whole request timeout before the next address is tried.
         const int MaxConnectMs = 10000;
         // Handshakes through one proxy address (TCP, TLS to the proxy, CONNECT, TLS with the site): every read waits at
-        // most this long. Working addresses of the official proxy needed 1.3-4.5 s for the whole check on the PC.
-        const int MaxAttemptMs = 7000;
+        // most this long. Working addresses of the official proxy needed 1.3-4.5 s for the WHOLE check on the PC (all
+        // round trips together), so one read never needs 5 s; with a 15 s route check up to six addresses that do not
+        // answer fit in before a working one, even without a learned order.
+        const int MaxAttemptMs = 5000;
         readonly int timeoutMs;
         readonly Stopwatch watch = Stopwatch.StartNew();
         readonly List<IDisposable> owned = new List<IDisposable>();
