@@ -109,58 +109,107 @@ PowerShell 5.1): CONNECT 200, TLS 1.3, сертификат `rutracker.org` от
   с ним. При скачивании допускаются не больше 3 переходов и только внутри `https://rutracker.org/forum/`.
 
 **Развёртывание на рабочем ПК — только по отдельному разрешению.** Пока в `C:\TorrentMonitor` работает 1.8,
-автозагрузка (если она включена) добавляет новые фильмы с **публичным** трекером. Их потом можно перепривязать
-(`12-…`), но до развёртывания автозагрузку можно и выключить: `C:\TorrentMonitor\7-Disable-autoload.cmd` —
-это решение пользователя.
+автозагрузка (если она включена) добавляет новые фильмы с **публичным** трекером. Обновление меняет только
+программу; `config.json`, `credential.xml`, `state.json`, `auto-state.json`, `autoload.json`, `feed-state.json`,
+журналы, торренты, файлы на D: и настройки µTorrent не затрагиваются. Задание `TorrentMonitor-DF` не меняется и
+не перерегистрируется (`1-Setup.cmd` не запускать). Все команды — Windows PowerShell 5.1 под **тем же
+пользователем Windows, под которым работает задание**.
 
-*A. Тестовая копия* — новая папка с этой версией, например `C:\TorrentControl-p0-tls13-test`; рядом со скриптами
-должна быть папка `lib`. `C:\TorrentMonitor`, µTorrent, Windows, DNS, VPN и Hiddify не меняются. Команды выполняются
-в PowerShell в папке копии, по одной:
-1. Снимок рабочей установки до проверки:
-   `Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.json,*.xml | Get-FileHash | Select-Object Path,Hash | Export-Csv $env:TEMP\tm-before.csv -NoTypeInformation`
-2. Маршрут с TLS 1.3 и запись его в копию:
-   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy https://ps1.blockme.site:443 -Save`
-   Нужна строка `https://ps1.blockme.site:443 (указан в команде): РАБОТАЕТ (HTTP 200, TLS 1.3, сертификат rutracker.org в порядке); адрес прокси …`
-   и `Записано в rutracker-proxy.txt`.
-3. `.\9-RuTracker-login.cmd`: проверка маршрута ещё до запроса пароля, окно Windows для логина и пароля RuTracker
-   (CAPTCHA, если сайт попросит, вводится вручную), затем «ПРОВЕРКА ПРОЙДЕНА … скачан с RuTracker» и сервер
-   статистики. Скрипт скачивает персональный `.torrent` текущей темы ленты, для которой файла ещё нет, сверяет
-   infohash и сохраняет его в `%LOCALAPPDATA%\TorrentControl\personal`; в µTorrent ничего не добавляется.
-   Пароль и cookie хранятся в папке копии (DPAPI этого пользователя Windows), в консоль не выводятся.
-4. Трекеры полученного файла без вывода ключа — команда из п. 6 «Проверки на реальном ПК» ниже: `Personal` ≥ 1,
-   `Public` = 0, `Other` = 0.
-5. Рабочая установка не изменилась:
-   `Compare-Object (Import-Csv $env:TEMP\tm-before.csv) (Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.json,*.xml | Get-FileHash | Select-Object Path,Hash) -Property Path,Hash`
-   — пустой вывод (если между снимками прошёл плановый опрос, изменятся только `state.json` и `auto-state.json`
-   самой версии 1.8).
+*0. Проверки перед обновлением (ничего не меняют).*
+```powershell
+Get-ScheduledTask -TaskName TorrentMonitor-DF | ForEach-Object { $_.Principal } | Format-List UserId, LogonType, RunLevel
+whoami
+(Get-ScheduledTask -TaskName TorrentMonitor-DF).Actions | Format-List Execute, Arguments, WorkingDirectory
+(Get-ScheduledTask -TaskName TorrentMonitor-DF).Settings | Format-List ExecutionTimeLimit, MultipleInstances
+Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Format-List LastRunTime, LastTaskResult, NextRunTime
+Get-Content C:\TorrentMonitor\autoload.json
+(Get-Content C:\TorrentMonitor\auto-state.json -Raw -Encoding UTF8 | ConvertFrom-Json).items | Group-Object status | Format-Table Name, Count
+Test-Path C:\TorrentMonitor\RuTracker.ps1
+```
+Ожидается: `UserId` совпадает с `whoami`, `LogonType` = `Interactive` (DPAPI и `%LOCALAPPDATA%` того же
+пользователя — как у `credential.xml`, который задание уже читает); действие —
+`-File "C:\TorrentMonitor\Monitor.ps1" -Once`; `ExecutionTimeLimit` = `PT5M` (запросы к RuTracker укладываются
+в 120 с на запись); `LastTaskResult` = 0; `RuTracker.ps1` нет (это 1.8). Если пользователь другой — вход
+(`9-RuTracker-login.cmd`) нужно выполнить под пользователем задания, а файлы `rutracker-*.xml` не копировать.
 
-*B. Рабочая установка* — только после успешной проверки A и отдельного разрешения:
-1. Резервная копия всей папки: `Copy-Item C:\TorrentMonitor C:\TorrentMonitor-backup-1.8 -Recurse`
-2. Делать сразу после очередного опроса:
-   `Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Select-Object LastRunTime, NextRunTime, LastTaskResult`
-3. Скопировать только программу, папку `lib` и маршрут. `config.json`, `credential.xml`, `state.json`,
-   `auto-state.json`, `autoload.json` и журналы не затрагиваются, торренты и µTorrent тоже:
-   `Copy-Item .\*.ps1, .\*.cs, .\*.cmd, .\README.md, .\README.txt, .\rutracker-proxy.txt -Destination C:\TorrentMonitor -Force`
-   `Copy-Item .\lib -Destination C:\TorrentMonitor -Recurse -Force`
-4. Проверить библиотеку: `Get-FileHash C:\TorrentMonitor\lib\bouncycastle\2.7.0\net461\BouncyCastle.Cryptography.dll`
-   → `4F96977E9C67334742C683410B3A361258219F0D3084A5E0BC10FBA96CF23A0D` (при другом значении скрипты сами
-   откажутся работать с RuTracker: `RuTrackerTlsComponentInvalid`).
-5. В `C:\TorrentMonitor` выполнить `9-RuTracker-login.cmd` под тем же пользователем Windows, под которым работает
-   планировщик (или, если это тот же пользователь, что в п. A3, скопировать из копии `rutracker-credential.xml`,
-   `rutracker-session.xml`, `rutracker-state.json` и запустить `10-RuTracker-check.cmd`).
-6. `2-Run-once.cmd`, затем в `auto-downloads.html` новые фильмы должны быть «Передано клиенту» со столбцом «Трекер»
-   `bt2.rutracker.cx` или «Ожидает авторизацию RuTracker» с причиной.
-7. В µTorrent у новой раздачи трекер `bt2.rutracker.cx` должен быть в статусе «работает», а в профиле RuTracker
-   отдача должна засчитываться.
+*1. Папка выпуска.* ZIP проверенного коммита распаковать в `C:\TorrentControl-deploy`; рядом со скриптами должна
+быть папка `lib`. Файлы входа берутся из тестовой копии, где прошёл вход (тот же пользователь Windows):
+```powershell
+$src = (Get-ChildItem C:\TorrentControl-deploy -Directory | Select-Object -First 1).FullName
+$tested = 'C:\TorrentControl-p0-tls13-test\TorrentControl-b003c76e51cd2070991ae73811f86b5876ef2694'
+(Get-FileHash "$src\lib\bouncycastle\2.7.0\net461\BouncyCastle.Cryptography.dll").Hash -eq '4F96977E9C67334742C683410B3A361258219F0D3084A5E0BC10FBA96CF23A0D'
+Copy-Item "$tested\rutracker-proxy.txt", "$tested\rutracker-credential.xml", "$tested\rutracker-session.xml", "$tested\rutracker-state.json" -Destination $src
+powershell -NoProfile -ExecutionPolicy Bypass -File "$src\Test-RuTrackerConnection.ps1" -NoOfficialProxy
+& "$src\10-RuTracker-check.cmd"
+```
+Ожидается `True`, строка `rutracker-proxy.txt: РАБОТАЕТ (HTTP 200, TLS 1.3, …)` и «ПРОВЕРКА ПРОЙДЕНА» без запроса
+пароля (персональный файл ещё одной текущей темы; в µTorrent ничего не добавляется).
 
-*Откат* — только программа; данные новой версии остаются на месте:
-`Copy-Item C:\TorrentMonitor-backup-1.8\*.ps1, C:\TorrentMonitor-backup-1.8\*.cs, C:\TorrentMonitor-backup-1.8\*.cmd, C:\TorrentMonitor-backup-1.8\README.* -Destination C:\TorrentMonitor -Force`
-- `auto-state.json`, `state.json`, `config.json`, `credential.xml` и `autoload.json` из резервной копии **не**
-  возвращать: в `auto-state.json` записаны раздачи, уже переданные новой версией, и это защита от повторной отправки.
-  Журналы совместимы; записи «Ожидает авторизацию RuTracker» версия 1.8 просто не обрабатывает.
-- Торренты в µTorrent, их трекеры и файлы на D: откат не затрагивает.
-- Файлы, которых нет в 1.8 (`RuTrackerTls13.*`, папка `lib`, `rutracker-*`, новые `.cmd`), версия 1.8 не читает;
-  их можно оставить. Список: `Get-ChildItem C:\TorrentMonitor | Where-Object { !(Test-Path (Join-Path C:\TorrentMonitor-backup-1.8 $_.Name)) }`.
+*2. Обновление* — одно окно PowerShell, сразу после очередного опроса. Пока окно держит `monitor.lock`, монитор
+не работает: опрос, начавшийся в это время, записывает в `monitor.log` строку `ERROR … IOException` и ничего не
+меняет.
+```powershell
+$dst = 'C:\TorrentMonitor'; $backup = 'C:\TorrentMonitor-backup-before-p0'
+$lock = $null
+while ($null -eq $lock) { try { $lock = [IO.File]::Open("$dst\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None') } catch { Write-Host 'Идёт опрос, жду…'; Start-Sleep -Seconds 5 } }
+New-Item $backup -ItemType Directory -ErrorAction Stop | Out-Null
+Copy-Item "$dst\*" -Destination $backup -Recurse -Exclude monitor.lock
+(Get-ChildItem $dst -Recurse -File | Where-Object Name -ne 'monitor.lock').Count; (Get-ChildItem $backup -Recurse -File).Count
+$dataBefore = Get-ChildItem "$dst\*" -File -Exclude *.ps1, *.cs, *.cmd, README.*, monitor.lock | Get-FileHash
+Copy-Item "$src\*.ps1", "$src\*.cs", "$src\*.cmd", "$src\README.md", "$src\README.txt" -Destination $dst -Force
+Copy-Item "$src\lib" -Destination $dst -Recurse -Force
+Copy-Item "$src\rutracker-proxy.txt", "$src\rutracker-credential.xml", "$src\rutracker-session.xml", "$src\rutracker-state.json" -Destination $dst
+$diff = @(Get-ChildItem "$src\*" -File -Include *.ps1, *.cs, *.cmd, README.* | Where-Object { (Get-FileHash $_.FullName).Hash -ne (Get-FileHash (Join-Path $dst $_.Name)).Hash }) + @(Get-ChildItem "$src\lib" -Recurse -File | Where-Object { (Get-FileHash $_.FullName).Hash -ne (Get-FileHash ($dst + $_.FullName.Substring($src.Length))).Hash })
+"Program files that differ: $($diff.Count)"
+Compare-Object $dataBefore (Get-ChildItem "$dst\*" -File -Exclude *.ps1, *.cs, *.cmd, README.*, monitor.lock | Get-FileHash) -Property Path, Hash
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". 'C:\TorrentMonitor\RuTracker.ps1'; Initialize-RuTrackerNet; 'TLS component OK'"
+$lock.Dispose()
+```
+Ожидается: два одинаковых числа (резервная копия полная); `Program files that differ: 0`; в `Compare-Object`
+только четыре новых файла `rutracker-*` со стрелкой `=>` и ни одного `<=` (данные не изменились);
+`TLS component OK`. Если что-то не так — сразу откат (ниже), не отпуская блокировку.
+
+*3. Проверка после обновления.*
+```powershell
+& C:\TorrentMonitor\10-RuTracker-check.cmd
+& C:\TorrentMonitor\2-Run-once.cmd
+Get-Content C:\TorrentMonitor\monitor.log -Tail 3
+Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Format-List LastRunTime, LastTaskResult
+```
+- «ПРОВЕРКА ПРОЙДЕНА» в `C:\TorrentMonitor` (тот же DPAPI-вход), в `monitor.log` последняя строка `OK:`, после
+  следующего планового опроса `LastTaskResult` = 0.
+- Новый фильм в `auto-downloads.html`: «Передано клиенту» со столбцом «Трекер» `bt4.rutracker.cx` (или другой
+  `bt*`), либо «Ожидает авторизацию RuTracker» с причиной — публичная версия в этом случае не добавляется.
+- В µTorrent у новой раздачи вкладка «Трекеры»: персональный сервер «работает»; затем отдача в профиле RuTracker.
+- Уже перепривязанные раздачи и записи `auto-state.json` в статусе «Добавлено, путь подтверждён» обновление не
+  трогает: автозагрузка работает только с новыми записями, перепривязка — только по командам `11-…`–`14-…`, а для
+  раздач с персональным трекером она показывает «Уже персональный трекер» и ничего не меняет.
+
+*Откат* — одно окно PowerShell; возвращается только программа 1.8, данные остаются:
+```powershell
+$dst = 'C:\TorrentMonitor'; $backup = 'C:\TorrentMonitor-backup-before-p0'
+$lock = $null
+while ($null -eq $lock) { try { $lock = [IO.File]::Open("$dst\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None') } catch { Write-Host 'Идёт опрос, жду…'; Start-Sleep -Seconds 5 } }
+$aside = 'C:\TorrentMonitor-p0-removed-' + (Get-Date -Format 'yyyyMMdd-HHmm')
+New-Item $aside -ItemType Directory -ErrorAction Stop | Out-Null
+Get-ChildItem "$dst\*" -File -Include *.ps1, *.cs, *.cmd | Where-Object { !(Test-Path -LiteralPath (Join-Path $backup $_.Name)) } | Move-Item -Destination $aside
+if (Test-Path "$dst\lib") { Move-Item "$dst\lib" -Destination $aside }
+Copy-Item "$backup\*.ps1", "$backup\*.cs", "$backup\*.cmd", "$backup\README.*" -Destination $dst -Force
+Select-String -Path "$dst\Monitor.ps1" -Pattern 'RuTracker' -Quiet
+$lock.Dispose()
+```
+- Ожидается `False` (Monitor 1.8 без RuTracker). Новые файлы программы не удаляются, а переносятся в
+  `C:\TorrentMonitor-p0-removed-…`; файлы `rutracker-*` (зашифрованный вход) версия 1.8 не читает.
+- `auto-state.json`, `state.json`, `config.json`, `credential.xml`, `autoload.json` из резервной копии **не**
+  возвращать: в `auto-state.json` записаны раздачи, уже переданные новой версией, — это защита от повторной отправки.
+- Записи «Ожидает авторизацию RuTracker» версия 1.8 не обрабатывает (её очередь — только «Ожидает метаданные»
+  и «Ожидает место»), поэтому и после отката они не добавляются с публичным трекером. Раздачи, добавленные новой
+  версией, остаются с персональным трекером; монитор 1.8 наблюдает их как обычно.
+
+*PR #3 (1.9, Cleanup Dry Run).* Ветку 1.9 поверх этой версии не разворачивать: в ней нет персональной загрузки,
+и новые фильмы снова пошли бы с публичным трекером. Версия 1.9 разворачивается только из `main` после слияния
+обоих PR (5 конфликтов-объединений проверены пробным слиянием, общий набор тестов зелёный) — тем же порядком
+«резервная копия → копирование под блокировкой → проверка».
 
 **Hiddify** (по исходному коду клиента `hiddify-app` / `hiddify-core`). Локальный порт — это sing-box `mixed`
 (HTTP и SOCKS на одном порту) на `127.0.0.1`. Он открыт в режимах «Только прокси» и «Установить системный прокси».

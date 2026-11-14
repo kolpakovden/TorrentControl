@@ -184,6 +184,7 @@ try {
         [void]$script:http.Add([pscustomobject]@{ method = $Method; url = $Url; form = $Form })
         [void]$script:allUrls.Add($Url)
         $script:proxySeen = $script:RuTrackerProxy
+        $script:deadlineSeen = $script:RuTrackerDeadline
         $kind = 'dl'; if ($Url -like '*login.php') { $kind = 'login' }
         $answer = $script:route[$kind]
         if ($answer -is [Collections.IList] -and $answer -isnot [byte[]] -and $answer.Count) { $next = $answer[0]; $script:route[$kind] = @($answer | Select-Object -Skip 1); $answer = $next }
@@ -266,6 +267,17 @@ try {
     Assert ((Get-TestSha1 (Read-Bytes $result.path)) -eq (Get-TestSha1 (Read-Bytes $site))) 'site file not saved byte for byte'
     Assert ($result.path -like "$($env:LOCALAPPDATA)*" -and $result.path -notlike "$dir*") 'personal torrent not in the Windows profile folder'
     Assert ($script:proxySeen -eq '') 'proxy used without rutracker-proxy.txt'
+    # The network part runs inside the time budget of the scheduled task, and the budget ends with the call.
+    $ahead = ($script:deadlineSeen - [DateTime]::UtcNow).TotalSeconds
+    Assert ($null -ne $script:deadlineSeen -and $ahead -gt 100 -and $ahead -le 120 -and $null -eq $script:RuTrackerDeadline) "time budget not applied: $ahead"
+    $script:RuTrackerDeadline = $null
+    Assert ((Get-RuTrackerTimeout 30000) -eq 30000) 'timeout changed outside Get-PersonalTorrent'
+    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(60)
+    $t = Get-RuTrackerTimeout 30000
+    Assert ($t -gt 19000 -and $t -le 20000 -and (Get-RuTrackerTimeout 15000) -eq 15000) "timeout inside the budget: $t"
+    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(4)
+    Assert ((Get-RuTrackerTimeout 30000) -eq 0) 'request allowed after the budget'
+    $script:RuTrackerDeadline = $null
     # A stored verified file is used without any request (the same file was just downloaded and stored).
     $script:http.Clear(); $calls = $script:routeCalls
     $again = Get-PersonalTorrent $dir $topic $siteHash

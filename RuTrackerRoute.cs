@@ -185,6 +185,9 @@ public static class RuTrackerRoute {
 
     sealed class Connection : IDisposable {
         const int MaxProxyAttempts = 3;
+        // A TCP connection to a working server takes well under a second; an address that does not answer must not
+        // use up the whole request timeout before the next address is tried.
+        const int MaxConnectMs = 10000;
         // Last proxy address that gave a full route, per proxy name and port (this process only, nothing is stored).
         static readonly Dictionary<string, string> LastGood = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
         readonly int timeoutMs;
@@ -350,7 +353,7 @@ public static class RuTrackerRoute {
             try {
                 candidate = new TcpClient(address.AddressFamily);   // throws where IPv6 is off: that address is skipped
                 IAsyncResult connect = candidate.BeginConnect(address, port, null, null);
-                if (!connect.AsyncWaitHandle.WaitOne(timeoutMs)) { candidate.Close(); return "Timeout"; }
+                if (!connect.AsyncWaitHandle.WaitOne(Math.Min(timeoutMs, MaxConnectMs))) { candidate.Close(); return "Timeout"; }
                 candidate.EndConnect(connect);
                 owned.Add(candidate);
                 client = candidate;

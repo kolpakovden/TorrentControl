@@ -281,6 +281,8 @@ function Invoke-AutoLoad($Entries,$Rows,$Paths,$Config,$Credential,[string]$Dire
                 $item.status='WaitingAuth';$item.reason=$code
                 return ('Автозагрузка ждёт персональный .torrent RuTracker (' + $code + '); публичная версия не добавляется.')
             }
+            # Defensive: only a verified personal file is ever handed to uTorrent.
+            if ($null -eq $personal -or ![string]$personal.path) {$item.status='WaitingAuth';$item.reason='PersonalTorrentInvalid';return 'Автозагрузка ждёт персональный .torrent RuTracker (PersonalTorrentInvalid); публичная версия не добавляется.'}
             $torrent=$personal.path
             $item | Add-Member -NotePropertyName tracker -NotePropertyValue ([string]$personal.host) -Force
             $item | Add-Member -NotePropertyName trackerKind -NotePropertyValue 'Personal' -Force

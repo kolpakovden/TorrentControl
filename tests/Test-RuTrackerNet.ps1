@@ -94,6 +94,17 @@ try {
         Assert ($response.status -eq 0 -and (Get-RuTrackerFailureCode $response.error) -eq 'RuTrackerProxyUnavailable') "$($case[0]) proxy: $($response.error)"
         Assert (([DateTime]::UtcNow - $started).TotalSeconds -lt 12) "$($case[0]) proxy: no timeout ($([int]([DateTime]::UtcNow - $started).TotalSeconds) s)"
     }
+    # A spent time budget (scheduled task limit) stops before any connection; no fixed wait.
+    $spent = New-FakeProxy 'connect-garbage'
+    $script:RuTrackerProxy = 'http://127.0.0.1:' + $spent.Port
+    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds(-1)
+    try {
+        $response = Invoke-RuTrackerHttp 'Get' 'https://rutracker.org/forum/dl.php?t=1' (New-RuTrackerSession 'bb_session=0-FAKE-COOKIE-NET-2')
+        Assert ($response.status -eq 0 -and $response.error -eq 'Timeout' -and (Get-RuTrackerFailureCode $response.error) -eq 'RuTrackerProxyUnavailable') "request after the budget: $($response.error)"
+        $r = Invoke-RuTrackerRouteCheck $script:RuTrackerProxy
+        Assert (!$r.Ok -and $r.Code -eq 'Timeout') "route check after the budget: $($r.Code)"
+    } finally { $script:RuTrackerDeadline = $null }
+    Assert ((Get-ProxyText $spent) -eq '') 'a request was sent after the budget'
     # Only HTTPS to rutracker.org/forum/ and the CAPTCHA host: anything else is refused before any connection.
     $guard = New-FakeProxy 'connect-garbage'
     $script:RuTrackerProxy = 'http://127.0.0.1:' + $guard.Port

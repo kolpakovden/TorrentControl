@@ -7,6 +7,7 @@ $ErrorActionPreference = 'Stop'
 . "$PSScriptRoot\RuTracker.ps1"
 $explain = @{
     SetupCancelled = 'Ввод отменён.'
+    MonitorBusy = 'Сейчас идёт опрос монитора (задание TorrentMonitor-DF). Повторите через минуту; ничего не отправлялось.'
     SetupNothingToCheck = 'Вход выполнен, но для всех текущих тем ленты персональные файлы уже есть: скачивать нечего. Повторите 10-RuTracker-check.cmd после выхода новых фильмов.'
     RuTrackerLoginFailed = 'RuTracker не принял логин или пароль. Проверьте их в браузере и повторите.'
     RuTrackerCaptchaRequired = 'RuTracker требует CAPTCHA, а код не подошёл. Повторите 9-RuTracker-login.cmd.'
@@ -31,7 +32,8 @@ $explain = @{
 }
 $lock = $null
 try {
-    $lock = [IO.File]::Open("$PSScriptRoot\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None')
+    # The monitor (scheduled task TorrentMonitor-DF) holds this lock while it polls: wait for it to finish.
+    try { $lock = [IO.File]::Open("$PSScriptRoot\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None') } catch { throw 'MonitorBusy' }
     $files = Get-RuTrackerFiles $PSScriptRoot
     $script:RuTrackerProxy = Resolve-RuTrackerProxy $PSScriptRoot
     if ($script:RuTrackerProxy) { Write-Host ('Запросы к RuTracker идут через прокси ' + $script:RuTrackerProxy + ' (только для TorrentControl).') }
@@ -92,7 +94,7 @@ try {
     Write-Host 'Это подтверждает получение файла. Начисление отдачи нужно проверить в профиле RuTracker (README, план проверки).'
 } catch {
     $code = Get-RuTrackerCode $_.Exception
-    if ([string]$_.Exception.Message -in @('SetupCancelled', 'SetupNothingToCheck')) { $code = [string]$_.Exception.Message }
+    if ([string]$_.Exception.Message -in @('SetupCancelled', 'SetupNothingToCheck', 'MonitorBusy')) { $code = [string]$_.Exception.Message }
     Write-Host ('RuTracker: ' + $code + ' — ' + $explain[$code]) -ForegroundColor Red
     exit 1
 } finally { if ($lock) { $lock.Dispose() } }

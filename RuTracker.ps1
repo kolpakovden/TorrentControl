@@ -35,6 +35,11 @@ $script:RuTrackerProxy = ''
 $script:RuTrackerTimeoutMs = 30000
 $script:RuTrackerCheckTimeoutMs = 15000
 $script:RuTrackerUserAgent = 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) TorrentControl'
+# One Get-PersonalTorrent call starts no RuTracker request after this many seconds: the scheduled task
+# TorrentMonitor-DF stops a run after 5 minutes, and a stopped run must never be the outcome of a slow proxy.
+# The record then waits for the next poll (no public version).
+$script:RuTrackerBudgetSeconds = 120
+$script:RuTrackerDeadline = $null
 $script:RuTrackerRouteOkAt = $null
 $script:RuTrackerRouteOkFor = $null
 $script:RuTrackerLastRoute = $null
@@ -228,11 +233,21 @@ function Initialize-RuTrackerNet {
     # or uncompilable part stops every RuTracker request with one code; there is no other way to reach RuTracker.
     try { Initialize-RuTrackerTransport 3>$null } catch { throw 'RuTrackerTlsComponentInvalid' }
 }
+function Get-RuTrackerTimeout([int]$TimeoutMs) {
+    # Timeout for the next request inside the budget of the current Get-PersonalTorrent call; 0 = budget spent.
+    # One request can take about three timeouts (up to 3 proxy addresses), hence a third of what is left.
+    if ($null -eq $script:RuTrackerDeadline) { return $TimeoutMs }
+    $left = ($script:RuTrackerDeadline - [DateTime]::UtcNow).TotalMilliseconds
+    if ($left -lt 5000) { return 0 }
+    return [int][math]::Min($TimeoutMs, [math]::Max(3000, $left / 3))
+}
 function Invoke-RuTrackerRouteCheck([string]$Proxy, [string]$HostName = 'rutracker.org', [int]$TimeoutMs = 0) {
     # Anonymous: TCP, TLS to an https proxy, CONNECT, TLS with normal certificate validation, status of
     # /forum/index.php (RuTrackerRoute.cs). No cookie or credential.
     Initialize-RuTrackerNet
     if ($TimeoutMs -le 0) { $TimeoutMs = $script:RuTrackerCheckTimeoutMs }
+    $TimeoutMs = Get-RuTrackerTimeout $TimeoutMs
+    if ($TimeoutMs -le 0) { $spent = New-Object RuTrackerRouteResult; $spent.Code = 'Timeout'; return $spent }
     $route = Get-RuTrackerRouteParts $Proxy
     return [RuTrackerRoute]::Check($route.scheme, $route.host, $route.port, $HostName, '/forum/index.php', $TimeoutMs)
 }
@@ -301,13 +316,15 @@ function Invoke-RuTrackerHttp([string]$Method, [string]$Url, $Session, [string]$
     # never carried to another address. Certificates are validated as usual; on any network or TLS failure only a
     # fixed code is returned, never an exception text. Replaced by stubs in most tests.
     if ($Url -notmatch '^https://(rutracker\.org/forum/|static\.rutracker\.cc/captcha/)') { throw 'RuTrackerRedirectRefused' }
+    $timeout = Get-RuTrackerTimeout $script:RuTrackerTimeoutMs
+    if ($timeout -le 0) { return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = 'Timeout' } }
     Initialize-RuTrackerNet
     $route = Get-RuTrackerRouteParts $script:RuTrackerProxy
     $body = $null; $type = ''
     if ($Form) { $body = [Text.Encoding]::ASCII.GetBytes($Form); $type = 'application/x-www-form-urlencoded' }
     try {
         $answer = [RuTrackerRoute]::Send($route.scheme, $route.host, $route.port, $Method.ToUpperInvariant(), $Url, $Session.Cookies, $type, $body,
-            $script:RuTrackerUserAgent, $script:RuTrackerTimeoutMs, 4000000)
+            $script:RuTrackerUserAgent, $timeout, 4000000)
     } catch {
         return [pscustomobject]@{ status = 0; contentType = ''; bytes = [byte[]]@(); location = ''; error = (Get-RuTrackerNetError $_.Exception) }
     }
@@ -436,29 +453,33 @@ function Get-PersonalTorrent([string]$Directory, [string]$Topic, [string]$Hash) 
     if ($state.blocked) { throw $state.blocked }
     $credential = Read-RuTrackerCredential $Directory
     if ($null -eq $credential) { throw 'RuTrackerNotConfigured' }
-    # No cookie or password leaves this computer before the route works anonymously with a valid certificate.
-    Assert-RuTrackerRoute
-    $session = New-RuTrackerSession (Read-RuTrackerSessionText $Directory)
-    $bytes = $null
-    if (Test-RuTrackerLoggedIn $session) {
-        try { $bytes = Get-RuTrackerTorrentBytes $session $Topic } catch { if ([string]$_.Exception.Message -ne 'RuTrackerAuthExpired') { throw } }
-    }
-    if ($null -eq $bytes) {
-        # One automatic login with the stored credential, not more often than every RuTrackerLoginPauseMinutes;
-        # a CAPTCHA or a refusal stops automatic logins until Setup-RuTracker.ps1.
-        $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$state.loginAt
-        if ($age -ge 0 -and $age -lt $script:RuTrackerLoginPauseMinutes * 60) { throw 'RuTrackerAuthExpired' }
-        Save-RuTrackerState $Directory '' -LoginAttempt
-        $login = Invoke-RuTrackerLogin $credential
-        if (!$login.ok) {
-            $code = 'RuTrackerLoginFailed'
-            if ($login.captcha) { $code = 'RuTrackerCaptchaRequired' }
-            Save-RuTrackerState $Directory $code
-            throw $code
+    # Time budget for the scheduled task (see RuTrackerBudgetSeconds); interactive scripts get the same limit.
+    $script:RuTrackerDeadline = [DateTime]::UtcNow.AddSeconds($script:RuTrackerBudgetSeconds)
+    try {
+        # No cookie or password leaves this computer before the route works anonymously with a valid certificate.
+        Assert-RuTrackerRoute
+        $session = New-RuTrackerSession (Read-RuTrackerSessionText $Directory)
+        $bytes = $null
+        if (Test-RuTrackerLoggedIn $session) {
+            try { $bytes = Get-RuTrackerTorrentBytes $session $Topic } catch { if ([string]$_.Exception.Message -ne 'RuTrackerAuthExpired') { throw } }
         }
-        Save-RuTrackerSessionText $Directory (Get-SessionCookieText $login.session)
-        $bytes = Get-RuTrackerTorrentBytes $login.session $Topic
-    }
-    $saved = Save-PersonalTorrentBytes $bytes $Hash $Topic
-    [pscustomobject]@{ path = $saved.path; host = $saved.host; tiers = $saved.tiers; size = $saved.size; source = 'RuTracker' }
+        if ($null -eq $bytes) {
+            # One automatic login with the stored credential, not more often than every RuTrackerLoginPauseMinutes;
+            # a CAPTCHA or a refusal stops automatic logins until Setup-RuTracker.ps1.
+            $age = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$state.loginAt
+            if ($age -ge 0 -and $age -lt $script:RuTrackerLoginPauseMinutes * 60) { throw 'RuTrackerAuthExpired' }
+            Save-RuTrackerState $Directory '' -LoginAttempt
+            $login = Invoke-RuTrackerLogin $credential
+            if (!$login.ok) {
+                $code = 'RuTrackerLoginFailed'
+                if ($login.captcha) { $code = 'RuTrackerCaptchaRequired' }
+                Save-RuTrackerState $Directory $code
+                throw $code
+            }
+            Save-RuTrackerSessionText $Directory (Get-SessionCookieText $login.session)
+            $bytes = Get-RuTrackerTorrentBytes $login.session $Topic
+        }
+        $saved = Save-PersonalTorrentBytes $bytes $Hash $Topic
+        [pscustomobject]@{ path = $saved.path; host = $saved.host; tiers = $saved.tiers; size = $saved.size; source = 'RuTracker' }
+    } finally { $script:RuTrackerDeadline = $null }
 }

@@ -144,6 +144,7 @@ try {
     function Get-PersonalTorrent {
         param($Directory, $Topic, $Hash)
         $script:personalCalls++
+        if ($script:personalMode -eq 'nothing') { return $null }
         if ($script:personalMode -ne 'ok') { throw $script:personalMode }
         $path = Join-Path $temp ('personal-' + $Hash + '.torrent')
         [IO.File]::WriteAllBytes($ExecutionContext.SessionState.Path.GetUnresolvedProviderPathFromPSPath($path), $script:personalBytes)
@@ -414,6 +415,10 @@ try {
         Assert (!$script:fakeD.ContainsKey('D:\Фильмы\rt-900000002') -and $message -match 'публичная версия не добавляется') "$code created the folder or hid the reason"
     }
     Assert ((Get-FileText (Join-Path $temp 'auto-downloads.html')) -match 'Ожидает авторизацию RuTracker') 'waiting state not shown'
+    Reset-AutoState
+    $script:personalMode = 'nothing'
+    $null = Run-Auto $new
+    Assert ((Get-AutoItem).status -eq 'WaitingAuth' -and (Get-AutoItem).reason -eq 'PersonalTorrentInvalid' -and $script:launches.Count -eq $before -and !$script:fakeD.ContainsKey('D:\Фильмы\rt-900000002')) 'launched without a personal file'
     # Login fixed: the waiting record is added once, never twice.
     $script:personalMode = 'ok'
     $null = Run-Auto $new
