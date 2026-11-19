@@ -36,6 +36,12 @@ foreach ($file in @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extensi
     }
 }
 
+# --- Cleanup remains a reporting-only module: no mutation or network calls. ----------------------
+$cleanupText = [IO.File]::ReadAllText((Join-Path $repo 'Cleanup.ps1'))
+foreach ($pattern in @('Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Process', 'Fetch-List', 'New-Item', 'Save-AutoJson', 'Out-File', 'Copy-Item')) {
+    Assert ($cleanupText -notmatch $pattern) "Cleanup.ps1 must not use '$pattern'"
+}
+
 # --- P0: personal RuTracker .torrent, secrets stay on this computer ----------------------------------
 $production = @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extension -in @('.ps1', '.cs', '.cmd') })
 foreach ($file in $production) {
