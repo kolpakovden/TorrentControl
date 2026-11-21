@@ -5,6 +5,7 @@ $root = $PSScriptRoot
 . "$root\LocalPaths.ps1"
 . "$root\Feed.ps1"
 . "$root\AutoLoad.ps1"
+. "$root\RuTracker.ps1"
 function Save-Json($Value, $Path) { Save-AutoJson $Value $Path }
 function Get-MonitorErrorCode($Exception) {
     # Fixed codes only; never log response bodies, tokens or URLs.
@@ -156,6 +157,8 @@ try {
         $lock = $null
         try {
             $lock = [IO.File]::Open("$root\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None')
+            # The scheduled task stops a run after 5 minutes: autoload keeps its network steps inside that limit.
+            $script:AutoRunDeadline = Get-AutoRunDeadline
             Collect
         } finally { if ($lock) { $lock.Dispose() } }
     }
