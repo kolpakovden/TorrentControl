@@ -17,12 +17,19 @@ foreach ($file in @(Get-ChildItem -LiteralPath $repo -Filter '*.cmd')) {
     Assert (@([IO.File]::ReadAllBytes($file.FullName) | Where-Object { $_ -gt 127 }).Count -eq 0) "$($file.Name) must stay ASCII"
 }
 
-# --- Production code never deletes data, changes client settings or acts on torrents via WebUI -------
-foreach ($file in @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extension -in @('.ps1', '.cs') })) {
+# --- Production code never deletes, moves or renames data, stops torrents or changes client settings ---
+# 1.9 cleanup is Dry Run only: no deletion or stop operation may exist anywhere in production code.
+foreach ($file in @(Get-ChildItem -LiteralPath $repo | Where-Object { $_.Extension -in @('.ps1', '.cs', '.cmd') })) {
     $text = [IO.File]::ReadAllText($file.FullName)
-    foreach ($pattern in @('Remove-Item', '::Delete\(', '\.Delete\(', 'removedata', 'setsetting', 'setprops', 'action=(?!getsettings\b)')) {
+    foreach ($pattern in @('Remove-', '::Delete\(', '\.Delete\(', 'DeleteFile', 'DeleteDirectory', 'Move-Item', 'Rename-Item', 'Clear-Content',
+        '\brmdir\b', '\brd\s+/', '\bdel\s', '\berase\s', 'Stop-Process', 'removedata', 'setsetting', 'setprops', 'action=(?!getsettings\b)')) {
         Assert ($text -notmatch $pattern) "$($file.Name) contains forbidden operation '$pattern'"
     }
+}
+# The cleanup module only reads history and writes its own reports.
+$cleanupText = [IO.File]::ReadAllText((Join-Path $repo 'Cleanup.ps1'))
+foreach ($pattern in @('Invoke-WebRequest', 'Invoke-RestMethod', 'Start-Process', 'Fetch-List', 'New-Item', 'Save-AutoJson', 'Out-File', 'Copy-Item')) {
+    Assert ($cleanupText -notmatch $pattern) "Cleanup.ps1 must not use '$pattern'"
 }
 
 # --- C# helpers compile with this runtime's compiler (C# 5 under Windows PowerShell 5.1) -----------
