@@ -12,11 +12,397 @@
    в `feed-state.json` добавится время последней использованной копии ленты.
 3. Запустить **2-Run-once.cmd** или дождаться задания `TorrentMonitor-DF`.
 4. Смотреть `report.html`, `films.html` и ссылку **Журнал автозагрузки** (`auto-downloads.html`).
+5. Для начисления статистики RuTracker: `9-RuTracker-login.cmd`, затем перепривязка уже скачанных раздач
+   (раздел «Персональная статистика RuTracker»). Без входа новые фильмы ждут авторизации и не добавляются.
 
 При обновлении с 1.7 повторно запускать `1-Setup.cmd` и `6-Enable-autoload.cmd` не требуется.
 При обновлении с 1.6 дополнительно запустить **6-Enable-autoload.cmd** (µTorrent должен быть запущен).
 Если монитор уже выполняется, включение может сообщить об ошибке блокировки: повторить после завершения опроса.
 **7-Disable-autoload.cmd** выключает только будущие добавления; текущие торренты продолжают работу.
+
+## Персональная статистика RuTracker
+
+**Почему отдача не начислялась.** Метаданные для автозагрузки GitHub Actions получают по magnet-ссылке
+с публичным адресом `http://bt.t-ru.org/ann?magnet`. Клиент дополнительно переписывал каждый `.torrent`
+(`TorrentMetadata.Sanitize`), оставляя только этот адрес. В публичном адресе нет ключа пользователя, поэтому трекер
+не может связать отдачу с учётной записью: раздачи TorrentControl работали, но в профиль RuTracker не попадали.
+Персональный `.torrent`, скачанный с сайта под своей учётной записью, содержит адрес вида
+`http://bt2.rutracker.cx/ann?kk=<ключ>`; сервер (`bt`, `bt2`, `bt3`…) и имя параметра бывают разными.
+
+**Как работает теперь.**
+- GitHub по-прежнему получает только публичную ленту и метаданные (размер, имена файлов) и не входит на RuTracker.
+  Логин, пароль, cookie, ключ и персональные `.torrent` туда не попадают.
+- Перед добавлением TorrentControl на этом компьютере скачивает персональный `.torrent` темы через вашу сессию
+  (`https://rutracker.org/forum/dl.php?t=<тема>`) и проверяет: infohash совпадает с лентой, файл корректен,
+  есть персональный адрес трекера. µTorrent получает **этот файл без изменений** — адрес, выданный сайтом, не
+  угадывается и не переписывается.
+- Персональным считается только адрес сервера RuTracker: узел `bt`, `bt2`, `bt3`… на подтверждённом домене
+  (`t-ru.org`, `rutracker.cx`, `rutracker.org`), путь ровно `/ann`, без порта, и параметры вида `имя=значение`.
+  Имя параметра (`kk`, `pk`…) и длина ключа не фиксируются. Адрес с параметрами на любом другом узле
+  (например, `https://example.com/announce?id=123`) персональным не считается. Новый домен добавляется только
+  после того, как он встретится в настоящем файле с rutracker.org.
+- В файле, кроме персонального адреса, допускается только `retracker.local` (его добавляет сам RuTracker).
+  Публичный или посторонний трекер рядом с персональным останавливает добавление (`PersonalTrackersUnexpected`).
+- Если персональный файл получить нельзя (вход не настроен, CAPTCHA, пароль не принят, сайт недоступен, файл
+  повреждён или без персонального адреса), запись получает статус «Ожидает авторизацию RuTracker» с причиной.
+  **Публичная версия не добавляется.** После устранения причины запись добавляется при следующем опросе.
+- Тема перезалита (хеш файла не совпал с лентой) — «Пропущено», старая версия не добавляется.
+- Истёкшая сессия: одна автоматическая попытка входа с сохранённым паролем, не чаще раза в 30 минут.
+  CAPTCHA или отказ останавливают автоматические входы до ручного запуска `9-RuTracker-login.cmd`.
+  CAPTCHA программа не распознаёт: картинку видит и код вводит человек.
+- В `auto-downloads.html` столбец «Трекер» показывает сервер статистики, без ключа.
+
+**Где хранятся секреты.**
+- `rutracker-credential.xml` (логин и пароль) и `rutracker-session.xml` (cookie сессии) зашифрованы Windows DPAPI
+  для текущего пользователя Windows, как и `credential.xml`. Задание `TorrentMonitor-DF` выполняется от имени того же
+  пользователя. Файл, сохранённый другим пользователем, не расшифровывается — код `RuTrackerCredentialUnreadable`.
+- Персональные `.torrent` лежат в `%LOCALAPPDATA%\TorrentControl\personal` (профиль пользователя), не в папке скриптов.
+- `rutracker-state.json` — только код блокировки, время последнего входа и имя сервера.
+- Все эти файлы в `.gitignore`. Журналы, HTML, CSV и сообщения об ошибках содержат только фиксированные коды
+  и имя сервера; ключи, cookie и пароли дополнительно маскируются.
+- Cookie браузера не читаются: используется только вход, выполненный в `9-RuTracker-login.cmd`.
+
+**Доступ к rutracker.org с этого компьютера.** Часто rutracker.org напрямую не открывается: DNS не разрешает имя,
+а `Invoke-WebRequest` возвращает статус 0. Firefox при этом работает через официальное расширение RuTracker.
+По его исходному коду (дополнение `rutracker-add-on` 0.9.32, лицензия MPL-2.0) запросы к `rutracker.org`,
+`static.rutracker.cc` и `api.rutracker.cc` идут через **HTTPS-прокси `ps1.blockme.site:443`**: TLS до прокси,
+внутри него туннель к `rutracker.org:443`, без пароля прокси. Обычный HTTP-прокси (например
+`http://px2.blockme.site:3128`) — это другой маршрут, и на этом ПК он не отвечает. Ни .NET Framework, ни
+Windows PowerShell 5.1 сами HTTPS-прокси не поддерживают, поэтому у TorrentControl свой транспорт
+`RuTrackerRoute.cs`. Расширение и данные Firefox TorrentControl не использует и не читает.
+
+**TLS 1.3 на Windows 10.** Сайт за этим прокси принимает только TLS 1.3 (на `ClientHello` TLS 1.2 он отвечает
+`protocol_version`), а Schannel в Windows 10 не умеет TLS 1.3 как клиент. Поэтому TLS с `rutracker.org` внутри
+туннеля выполняет `RuTrackerTls13.cs` на библиотеке BouncyCastle.Cryptography 2.7.0 (MIT,
+`lib\bouncycastle\2.7.0`, происхождение и хеши — в `SOURCE.txt`). Проверено на ПК пользователя (Windows 10 22H2,
+PowerShell 5.1): CONNECT 200, TLS 1.3, сертификат `rutracker.org` от Let's Encrypt, ответ 200.
+- Библиотека ничего не устанавливает и не регистрирует: `RuTrackerTls13.ps1` читает DLL, сравнивает SHA-256
+  с зашитым значением и загружает в процесс именно эти байты. Нет папки `lib`, или файл заменён — ни одного запроса
+  к RuTracker, код `RuTrackerTlsComponentInvalid`.
+- Сертификат сайта принимается, только если Windows (`X509Chain`) строит цепочку до доверенного корня этого
+  компьютера с назначением «проверка подлинности сервера» и действующими датами, и в нём есть имя `rutracker.org`.
+  Исключений и ослаблений нет; TLS с самим прокси — по-прежнему Windows (Schannel, TLS 1.2) с проверкой имени
+  прокси. Второго способа связи с RuTracker нет.
+- **Адреса прокси.** У имени `ps1.blockme.site` 9 адресов, и работает обычно только часть (на ПК пользователя —
+  4 из 9). Поэтому:
+  - DNS спрашивается при каждом запросе. Порядок адресов — по опыту: сначала те, что сработали последними (самый
+    свежий первым), затем неизвестные в порядке DNS, затем отказавшие за последние 6 часов.
+  - Опыт хранится в `rutracker-proxy-addresses.json` рядом со скриптами: только адреса прокси и время, без
+    секретов. Запись атомарная (`.tmp` → замена, `.bak`). Испорченный или чужой файл просто не используется.
+    Поэтому следующий запуск задания начинает с последнего рабочего адреса.
+  - Навсегда ничего не закрепляется. Отказ сдвигает адрес назад; через 6 часов отказавший адрес снова считается
+    неизвестным; адрес, которого 7 дней нет в ответах DNS, не используется. Без DNS (имя не разрешилось)
+    пробуются запомненные адреса — сертификат всё равно проверяется для имени.
+  - Пробуются **все** адреса, пока позволяет время запроса. На TLS-рукопожатия через один адрес отводится не больше
+    5 с на каждое чтение (рабочим адресам на ПК требовалось 1,3–4,5 с на всю проверку). Новый адрес начинается, только если после него останется один тайм-аут на запрос и
+    ответ. Весь запрос жёстко ограничен тремя тайм-аутами.
+  - Сертификат `https`-прокси проверяется для **имени** `ps1.blockme.site`, какой бы адрес ни использовался.
+    Сетевая ошибка TLS с прокси (нет ответа, обрыв) — переход к следующему адресу. **Отказ сертификата** прокси
+    (`ProxyCertificateInvalid`) или сайта (`TlsCertificateInvalid`) и запрос пароля прокси перебор
+    **останавливают**.
+  - Переход к другому адресу — только до отправки запроса. Запрос (в том числе POST входа) отправляется один раз;
+    если после этого ответ оборвался, другой адрес не пробуется.
+- Маршрут выбирается так: `rutracker-proxy.txt` (одна строка `https://ps1.blockme.site:443` или
+  `http://127.0.0.1:<порт>`), иначе прокси Windows, если он задан, иначе прямое соединение. Через этот маршрут идут
+  только вход на rutracker.org и скачивание `.torrent`. µTorrent, WebTLO, Firefox, остальные программы, DNS,
+  маршруты, VPN, реестр и прокси Windows не меняются. Hiddify не запускается и не перенастраивается.
+- HTTPS идёт через CONNECT: прокси видит только `rutracker.org:443`, а адрес страницы, пароль и cookie передаются
+  внутри TLS с rutracker.org. Сертификат проверяется обычным образом у сайта, а у `https://`-прокси — ещё и у самого
+  прокси; проверка не отключается. Прокси с паролем и SOCKS не поддерживаются.
+- Официальный прокси RuTracker проверяет и предлагает `15-RuTracker-connection.cmd`, записывается он только после
+  ввода `YES`. Других внешних прокси TorrentControl не предлагает.
+- Перед первым запросом с паролем или cookie маршрут проверяется анонимно: соединение, CONNECT, TLS с проверкой
+  сертификата и ответ `https://rutracker.org/forum/index.php`. Если проверка не прошла, пароль и cookie не
+  отправляются, запись ждёт с кодом, и **публичная версия не добавляется**. Коды:
+  - `RuTrackerUnavailable` — сайт недоступен напрямую, нужен прокси;
+  - `RuTrackerProxyUnavailable` — прокси не отвечает, требует пароль или не открыл туннель;
+  - `RuTrackerTlsFailed` — ошибка TLS или сертификата;
+  - `RuTrackerTlsComponentInvalid` — нет папки `lib\bouncycastle` рядом со скриптами или её файл изменён;
+  - `RuTrackerBlocked` — сайт ответил 403 или 429;
+  - `RuTrackerRedirectRefused` — перенаправление за пределы `https://rutracker.org/forum/`.
+- Перенаправления не выполняются автоматически. Ответ на вход не открывается вообще: cookie сессии приходит вместе
+  с ним. При скачивании допускаются не больше 3 переходов и только внутри `https://rutracker.org/forum/`.
+
+**Развёртывание на рабочем ПК — только по отдельному разрешению.** Пока в `C:\TorrentMonitor` работает 1.8,
+автозагрузка (если она включена) добавляет новые фильмы с **публичным** трекером. Обновление меняет только
+программу; `config.json`, `credential.xml`, `state.json`, `auto-state.json`, `autoload.json`, `feed-state.json`,
+журналы, торренты, файлы на D: и настройки µTorrent не затрагиваются. Задание `TorrentMonitor-DF` не меняется и
+не перерегистрируется (`1-Setup.cmd` не запускать). Все команды — Windows PowerShell 5.1 под **тем же
+пользователем Windows, под которым работает задание**.
+
+*0. Проверки перед обновлением (ничего не меняют).*
+```powershell
+Get-ScheduledTask -TaskName TorrentMonitor-DF | ForEach-Object { $_.Principal } | Format-List UserId, LogonType, RunLevel
+whoami
+(Get-ScheduledTask -TaskName TorrentMonitor-DF).Actions | Format-List Execute, Arguments, WorkingDirectory
+(Get-ScheduledTask -TaskName TorrentMonitor-DF).Settings | Format-List ExecutionTimeLimit, MultipleInstances
+Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Format-List LastRunTime, LastTaskResult, NextRunTime
+Get-Content C:\TorrentMonitor\autoload.json
+(Get-Content C:\TorrentMonitor\auto-state.json -Raw -Encoding UTF8 | ConvertFrom-Json).items | Group-Object status | Format-Table Name, Count
+Test-Path C:\TorrentMonitor\RuTracker.ps1
+```
+Ожидается: `UserId` совпадает с `whoami`, `LogonType` = `Interactive` (DPAPI и `%LOCALAPPDATA%` того же
+пользователя — как у `credential.xml`, который задание уже читает); действие —
+`-File "C:\TorrentMonitor\Monitor.ps1" -Once`; `ExecutionTimeLimit` = `PT5M`; `LastTaskResult` = 0;
+`RuTracker.ps1` нет (это 1.8). Если пользователь другой — вход (`9-RuTracker-login.cmd`) нужно выполнить под
+пользователем задания, а файлы `rutracker-*` не копировать.
+
+*Лимит 5 минут одного опроса.* Задание останавливает запуск через 5 минут, а автозагрузка за один опрос
+рассматривает до трёх записей. Поэтому ограничен весь запуск, а не одна запись:
+- от старта процесса монитор отводит 240 с на шаги автозагрузки, которые могут ждать сеть (GitHub, WebUI,
+  RuTracker); последние 60 с остаются на передачу в µTorrent и сохранение `auto-state.json`, `state.json` и отчётов;
+- очередная запись начинается, только если до этой границы не меньше 90 с (метаданные GitHub — 25 с, список
+  WebUI — 2 × 30 с), а запросы к RuTracker — только если осталось не меньше 30 с; иначе запись ждёт следующего
+  опроса с причиной «лимит задания», публичная версия не добавляется;
+- запросы к RuTracker одной записи укладываются в 120 с и в общую границу; каждый запрос жёстко прерывается через
+  3 тайм-аута (сокеты закрываются), поэтому медленный сервер не может растянуть его дольше.
+
+*1. Папка выпуска.* ZIP коммита для развёртывания распаковать в `C:\TorrentControl-deploy`; рядом со скриптами
+должна быть папка `lib`. Файлы входа берутся из тестовой копии, где прошли вход и скачивание персонального файла:
+`C:\TorrentControl-p0-integration-test` (папка с `Setup-RuTracker.ps1` и `rutracker-credential.xml` внутри неё).
+```powershell
+$src = (Get-ChildItem C:\TorrentControl-deploy -Directory | Select-Object -First 1).FullName; $src
+(Get-FileHash "$src\lib\bouncycastle\2.7.0\net461\BouncyCastle.Cryptography.dll").Hash -eq '4F96977E9C67334742C683410B3A361258219F0D3084A5E0BC10FBA96CF23A0D'
+$tested = @(Get-ChildItem C:\TorrentControl-p0-integration-test -Recurse -File -Filter Setup-RuTracker.ps1 | ForEach-Object DirectoryName | Where-Object { Test-Path -LiteralPath (Join-Path $_ 'rutracker-credential.xml') }); $tested
+$loginFiles = 'rutracker-proxy.txt', 'rutracker-credential.xml', 'rutracker-session.xml', 'rutracker-state.json'
+$loginFiles | ForEach-Object { '{0,-26} {1}' -f $_, (Test-Path -LiteralPath (Join-Path $tested[0] $_)) }
+Get-Content (Join-Path $tested[0] 'rutracker-proxy.txt'); [bool](Import-Clixml (Join-Path $tested[0] 'rutracker-credential.xml')).GetNetworkCredential().Password
+if ($tested.Count -eq 1) { Copy-Item ($loginFiles | ForEach-Object { Join-Path $tested[0] $_ }) -Destination $src } else { Write-Host "Найдено копий со входом: $($tested.Count) — нужна ровно одна" }
+powershell -NoProfile -ExecutionPolicy Bypass -File "$src\Test-RuTrackerConnection.ps1" -NoOfficialProxy -Save
+& "$src\10-RuTracker-check.cmd"
+```
+Ожидается: путь выпуска; `True`; **ровно один** путь внутри `C:\TorrentControl-p0-integration-test`; четыре
+строки `rutracker-*` с `True` (если хоть одна `False` — дальше не идти: в этой копии вход не завершён);
+`https://ps1.blockme.site:443` и `True` (DPAPI этого пользователя расшифровывает вход; пароль не показывается);
+строки адресов `ps1.blockme.site` и «Рабочих адресов: N из 9» (N ≥ 1), затем «Записан порядок адресов прокси»;
+«ПРОВЕРКА ПРОЙДЕНА» без запроса пароля (персональный файл ещё одной текущей темы; в µTorrent ничего не добавляется).
+
+*2. Обновление* — одно окно PowerShell, сразу после очередного опроса. Пока окно держит `monitor.lock`, монитор
+не работает: опрос, начавшийся в это время, записывает в `monitor.log` строку `ERROR … IOException` и ничего не
+меняет.
+```powershell
+$dst = 'C:\TorrentMonitor'; $backup = 'C:\TorrentMonitor-backup-before-p0'
+if ($null -eq $lock -or !$lock.CanRead) { $lock = $null; while ($null -eq $lock) { try { $lock = [IO.File]::Open("$dst\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None') } catch { Write-Host 'Идёт опрос, жду…'; Start-Sleep -Seconds 5 } } }
+New-Item $backup -ItemType Directory -ErrorAction Stop | Out-Null
+Copy-Item "$dst\*" -Destination $backup -Recurse -Exclude monitor.lock
+(Get-ChildItem $dst -Recurse -File | Where-Object Name -ne 'monitor.lock').Count; (Get-ChildItem $backup -Recurse -File).Count
+$dataBefore = Get-ChildItem "$dst\*" -File -Exclude *.ps1, *.cs, *.cmd, README.*, monitor.lock | Get-FileHash
+Copy-Item "$src\*.ps1", "$src\*.cs", "$src\*.cmd", "$src\README.md", "$src\README.txt" -Destination $dst -Force
+Copy-Item "$src\lib" -Destination $dst -Recurse -Force
+Copy-Item "$src\rutracker-proxy.txt", "$src\rutracker-credential.xml", "$src\rutracker-session.xml", "$src\rutracker-state.json" -Destination $dst
+if (Test-Path "$src\rutracker-proxy-addresses.json") { Copy-Item "$src\rutracker-proxy-addresses.json" -Destination $dst }
+$diff = @(Get-ChildItem "$src\*" -File -Include *.ps1, *.cs, *.cmd, README.* | Where-Object { (Get-FileHash $_.FullName).Hash -ne (Get-FileHash (Join-Path $dst $_.Name)).Hash }) + @(Get-ChildItem "$src\lib" -Recurse -File | Where-Object { (Get-FileHash $_.FullName).Hash -ne (Get-FileHash ($dst + $_.FullName.Substring($src.Length))).Hash })
+"Program files that differ: $($diff.Count)"
+Compare-Object $dataBefore (Get-ChildItem "$dst\*" -File -Exclude *.ps1, *.cs, *.cmd, README.*, monitor.lock | Get-FileHash) -Property Path, Hash | ForEach-Object { 'data ' + $_.SideIndicator + ' ' + (Split-Path $_.Path -Leaf) }
+powershell -NoProfile -ExecutionPolicy Bypass -Command ". 'C:\TorrentMonitor\RuTracker.ps1'; Initialize-RuTrackerNet; 'TLS component OK'"
+$lock.Dispose()
+```
+Ожидается: два одинаковых числа (резервная копия полная); `Program files that differ: 0`; в `Compare-Object`
+строки `data => rutracker-…` только для новых файлов входа и порядка адресов (четыре или пять) и ни одной
+`data <=` (данные не изменились);
+`TLS component OK`. Если что-то не так — сразу откат (ниже) в этом же окне: он берёт ту же блокировку.
+
+*3. Проверка после обновления.*
+```powershell
+& C:\TorrentMonitor\10-RuTracker-check.cmd
+& C:\TorrentMonitor\2-Run-once.cmd
+Get-Content C:\TorrentMonitor\monitor.log -Tail 3
+Get-ScheduledTaskInfo -TaskName TorrentMonitor-DF | Format-List LastRunTime, LastTaskResult
+```
+- «ПРОВЕРКА ПРОЙДЕНА» в `C:\TorrentMonitor` (тот же DPAPI-вход), в `monitor.log` последняя строка `OK:`, после
+  следующего планового опроса `LastTaskResult` = 0.
+- Новый фильм в `auto-downloads.html`: «Передано клиенту» со столбцом «Трекер» `bt4.rutracker.cx` (или другой
+  `bt*`), либо «Ожидает авторизацию RuTracker» с причиной — публичная версия в этом случае не добавляется.
+- В µTorrent у новой раздачи вкладка «Трекеры»: персональный сервер «работает»; затем отдача в профиле RuTracker.
+- Уже перепривязанные раздачи и записи `auto-state.json` в статусе «Добавлено, путь подтверждён» обновление не
+  трогает: автозагрузка работает только с новыми записями, перепривязка — только по командам `11-…`–`14-…`, а для
+  раздач с персональным трекером она показывает «Уже персональный трекер» и ничего не меняет.
+
+*Откат* — одно окно PowerShell (можно то же, что при обновлении). Возвращается только программа 1.8, данные
+остаются, а **автозагрузка выключается до запуска 1.8**: версия 1.8 добавляла бы новые фильмы с публичным
+трекером.
+```powershell
+$dst = 'C:\TorrentMonitor'; $backup = 'C:\TorrentMonitor-backup-before-p0'
+if ($null -eq $lock -or !$lock.CanRead) { $lock = $null; while ($null -eq $lock) { try { $lock = [IO.File]::Open("$dst\monitor.lock", 'OpenOrCreate', 'ReadWrite', 'None') } catch { Write-Host 'Идёт опрос, жду…'; Start-Sleep -Seconds 5 } } }
+if (Test-Path "$dst\autoload.json") { $auto = Get-Content "$dst\autoload.json" -Raw -Encoding UTF8 | ConvertFrom-Json; $auto.enabled = $false; $auto | ConvertTo-Json | Set-Content "$dst\autoload.json" -Encoding UTF8 }
+if (Test-Path "$dst\autoload.json") { 'autoload enabled: ' + (Get-Content "$dst\autoload.json" -Raw -Encoding UTF8 | ConvertFrom-Json).enabled } else { 'autoload.json нет — автозагрузка не включалась' }
+$aside = 'C:\TorrentMonitor-p0-removed-' + (Get-Date -Format 'yyyyMMdd-HHmm'); New-Item $aside -ItemType Directory -ErrorAction Stop | Out-Null
+Get-ChildItem "$dst\*" -File -Include *.ps1, *.cs, *.cmd | Where-Object { !(Test-Path -LiteralPath (Join-Path $backup $_.Name)) } | Move-Item -Destination $aside
+if (Test-Path "$dst\lib") { Move-Item "$dst\lib" -Destination $aside }
+Copy-Item "$backup\*.ps1", "$backup\*.cs", "$backup\*.cmd", "$backup\README.*" -Destination $dst -Force
+Select-String -Path "$dst\Monitor.ps1" -Pattern 'RuTracker' -Quiet
+$lock.Dispose()
+```
+- Ожидается `autoload enabled: False` (или «autoload.json нет») **до** восстановления файлов 1.8 и `False` у
+  `Select-String` (Monitor 1.8 без RuTracker). Блокировка снимается последней: ни один опрос 1.8 не начнётся
+  с включённой автозагрузкой. Изменено только поле `enabled`; `auto-state.json` и очередь не трогаются.
+- **На 1.8 автозагрузку не включать** (`6-Enable-autoload.cmd`): новые фильмы пошли бы с публичным трекером.
+  Включать снова — только после повторного развёртывания персональной версии; `6-Enable-autoload.cmd` сохраняет
+  существующий `auto-state.json`.
+- Новые файлы программы не удаляются, а переносятся в `C:\TorrentMonitor-p0-removed-…`; файлы `rutracker-*`
+  (зашифрованный вход) версия 1.8 не читает.
+- `auto-state.json`, `state.json`, `config.json`, `credential.xml` из резервной копии **не** возвращать: в
+  `auto-state.json` записаны раздачи, уже переданные новой версией, — это защита от повторной отправки.
+- Записи «Ожидает авторизацию RuTracker» 1.8 не обрабатывает. Раздачи, добавленные новой версией, остаются с
+  персональным трекером; монитор 1.8 наблюдает их как обычно.
+
+*PR #3 (1.9, Cleanup Dry Run).* Ветку 1.9 поверх этой версии не разворачивать: в ней нет персональной загрузки,
+и новые фильмы снова пошли бы с публичным трекером. Версия 1.9 разворачивается только из `main` после слияния
+обоих PR (5 конфликтов-объединений проверены пробным слиянием, общий набор тестов зелёный) — тем же порядком
+«резервная копия → копирование под блокировкой → проверка».
+
+**Hiddify** (по исходному коду клиента `hiddify-app` / `hiddify-core`). Локальный порт — это sing-box `mixed`
+(HTTP и SOCKS на одном порту) на `127.0.0.1`. Он открыт в режимах «Только прокси» и «Установить системный прокси».
+В режиме «VPN», который стоит по умолчанию, локальный порт не открывается.
+1. Подключитесь в Hiddify к своему профилю.
+2. В настройках выберите «Режим службы» → «Только прокси». Этот режим не меняет прокси Windows и не направляет
+   остальной трафик через Hiddify. «Установить системный прокси» тоже подойдёт, но переключит на прокси всю Windows.
+3. Там же посмотрите «Порт прокси (SOCKS5/4, HTTP)». По умолчанию это 12334, но используйте значение из настройки.
+4. Запустите `15-RuTracker-connection.cmd`. Он найдёт порты Hiddify / sing-box на этом компьютере, проверит каждый
+   настоящим запросом через HTTP CONNECT и предложит записать рабочий в `rutracker-proxy.txt` (нужно ввести `YES`).
+   Порты других программ (WebUI µTorrent и т. п.) не проверяются.
+
+Если локального прокси нет (Hiddify не установлен, не подключён или работает только как VPN), TorrentControl не
+сможет получать персональные `.torrent`, и автозагрузка будет ждать. Внешние прокси из интернета автоматически
+не предлагаются и не используются.
+
+`Test-RuTrackerConnection.ps1` (запускается из `15-RuTracker-connection.cmd`) проверяет:
+- DNS и прямое HTTPS;
+- прокси из `rutracker-proxy.txt`, прокси Windows и найденные порты Hiddify;
+- для каждого прокси: соединение, CONNECT, TLS и ответ сайта. В строке «РАБОТАЕТ» указаны версия TLS
+  с `rutracker.org`, адрес прокси, через который прошла проверка, и сколько адресов пробовалось;
+- для прокси с именем (например `ps1.blockme.site`) — ещё и **каждый его адрес отдельно**. Например:
+  `193.29.12.104:443: РАБОТАЕТ (TLS 1.3, HTTP 200)`, `82.21.4.208:443: нет ответа (этап: TLS с прокси)`,
+  `135.181.99.133:443: TLS с прокси оборвался или не ответил (сетевая ошибка)` или `сертификат прокси отклонён (…)`.
+  Затем итог «Рабочих адресов: N из M». Прокси считается рабочим, если работает хотя бы один адрес.
+
+Причину отказа он объясняет понятным текстом и сохраняет отчёт в `rutracker-connection.txt`. Логин, пароль, cookie
+и адреса трекеров он не читает и не использует. Параметры: `-Proxy http://127.0.0.1:<порт>`, `-FindLocalProxy`,
+`-Save` (записать рабочий прокси без вопроса, а для прокси с именем — и найденный порядок адресов в
+`rutracker-proxy-addresses.json`), `-NoAddressProbe` (не проверять адреса по отдельности), `-TimeoutSec`.
+
+**Проверка на реальном ПК (тестовая копия, отдельно от `C:\TorrentMonitor`).** Команды выполняются в PowerShell
+в папке тестовой копии; вместо `12334` подставьте свой порт.
+1. Снимок рабочей установки до проверки:
+   `Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.xml,config.json | Get-FileHash | Select-Object Path,Hash | Export-Csv $env:TEMP\tm-before.csv -NoTypeInformation`
+2. Локальный HTTP-прокси Hiddify:
+   `Get-NetTCPConnection -State Listen | Where-Object { $_.LocalAddress -in '127.0.0.1','0.0.0.0' } | ForEach-Object { '{0}:{1} {2}' -f $_.LocalAddress, $_.LocalPort, (Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName } | Select-String 'hiddify|sing-box'`
+3. RuTracker через него, без входа:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy http://127.0.0.1:12334`
+   Нужна строка `РАБОТАЕТ (HTTP 200, TLS и сертификат в порядке)`.
+4. Записать прокси в тестовую копию:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-RuTrackerConnection.ps1 -Proxy http://127.0.0.1:12334 -Save`
+5. Вход: `.\9-RuTracker-login.cmd`. Он проверит маршрут ещё до запроса пароля, затем скачает персональный `.torrent`
+   текущей темы ленты и сверит infohash.
+6. Персональный `.torrent` и его announce, без вывода ключа:
+   `powershell -NoProfile -ExecutionPolicy Bypass -Command '. .\AutoLoad.ps1; . .\RuTracker.ps1; $f = Get-ChildItem "$env:LOCALAPPDATA\TorrentControl\personal\*.torrent" | Sort-Object LastWriteTime | Select-Object -Last 1; $i = Get-TorrentTrackerInfo $f.FullName; [pscustomobject]@{ File = $f.Name; Host = $i.host; Personal = $i.personal; Public = $i.public; Other = $i.other } | Format-List'`
+   Ожидается сервер `bt2.rutracker.cx` (или другой `bt*`), `Personal` ≥ 1, `Public` = 0, `Other` = 0. Имя файла — это infohash темы.
+7. Рабочая установка не изменилась:
+   `Compare-Object (Import-Csv $env:TEMP\tm-before.csv) (Get-ChildItem C:\TorrentMonitor\* -File -Include *.ps1,*.cs,*.cmd,*.xml,config.json | Get-FileHash | Select-Object Path,Hash) -Property Path,Hash`
+   — пустой вывод. Плюс `Test-Path C:\TorrentMonitor\rutracker-*` → `False`. Скрипты входа и проверки не обращаются
+   к WebUI и не запускают µTorrent, поэтому в µTorrent новых раздач быть не должно.
+
+**Импорт персонального `.torrent` из Firefox (без сети).** Если TorrentControl сейчас не может обращаться
+к RuTracker сам, а Firefox (вход в RuTracker, официальный плагин) может, файлы скачиваются в Firefox и импортируются.
+TorrentControl при этом не обращается к сети и не читает данные браузера: файл выбирает пользователь.
+- Infohash вычисляется из самого файла; номер темы в имени файла не используется. Hash должен совпасть с записью
+  `auto-state.json`: новый фильм, ждущий персональный файл, или старая раздача TorrentControl в своей папке
+  `D:\Фильмы\rt-<тема>`.
+- Необязательный `-Topic` должен совпасть с темой этой записи. Тема в комментарии файла, если она там есть, не должна
+  ей противоречить.
+- Проверяются bencode и пути (`TorrentMetadata.Verify`) и персональный адрес подтверждённого сервера RuTracker
+  (`Test-PersonalTorrent`). Публичный, посторонний или смешанный список трекеров — отказ. Announce не изменяется
+  и не подставляется.
+- Файл сохраняется байт в байт как `%LOCALAPPDATA%\TorrentControl\personal\<HASH>.torrent`. Папка доступна только
+  текущему пользователю Windows. Повторный импорт того же файла ничего не меняет. Файл, не прошедший проверку,
+  сохранённый не заменяет.
+- `Get-PersonalTorrent` (автозагрузка и перепривязка) сначала берёт такой файл и перед каждым использованием
+  проверяет его заново. Подменённый или повреждённый файл не используется (`PersonalImportInvalid`). Если файла нет,
+  поведение прежнее: «Ожидает авторизацию RuTracker», без публичной версии.
+- Коды отказа: `ImportFileMissing`, `ImportNotInAutoState`, `ImportTopicMismatch`, `ImportStatusNotAllowed`
+  (ручная или чужая запись), `PersonalTorrentInvalid`, `PersonalAnnounceMissing`, `PersonalTrackersUnexpected`,
+  `PersonalTopicMismatch`.
+
+**Подготовка перепривязки старой раздачи (Dry Run, ничего не меняет).** `17-Check-personal-migration.cmd`
+(`Test-PersonalMigration.ps1`):
+- **Список.** `-List` показывает старые раздачи TorrentControl: тему, ссылку на тему, ссылку «скачать .torrent» для
+  Firefox и отметку, импортирован ли файл. Список сохраняется в `personal-migration-list.html`.
+- **Проверка одной раздачи.** `-Topic <номер>` проверяет её целиком:
+  - что раздача принадлежит TorrentControl;
+  - что импортированный файл в порядке;
+  - что в µTorrent есть раздача с тем же hash в своей папке;
+  - что сейчас у неё только публичный трекер.
+
+  Итог — «ГОТОВО К ПЕРЕПРИВЯЗКЕ» или «НЕ ГОТОВО» с причиной.
+- **µTorrent только читается:** `token.html`, `list=1`, `getprops`. Изменяющие функции перепривязки в этом процессе
+  отключены (`ReadOnlyViolation`). Ручные и чужие раздачи из µTorrent даже не читаются.
+- **Рабочая папка** (`-StateDirectory C:\TorrentMonitor`) только читается: `auto-state.json`, `config.json` и
+  `credential.xml` (пароль WebUI расшифровывается в памяти и не копируется). Чтение не мешает работающему монитору,
+  отчёты пишутся в папку тестовой копии. Без WebUI (`-NoWebUI`) проверяются только запись и файл; это не
+  подтверждение готовности.
+
+**Тестовая копия `C:\TorrentControl-p0-net-test`, рабочая установка `C:\TorrentMonitor` не меняется.**
+PowerShell, по одной строке:
+1. `cd C:\TorrentControl-p0-net-test`
+2. Список старых раздач и ссылок:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-PersonalMigration.ps1 -List -StateDirectory C:\TorrentMonitor`
+3. В Firefox открыть `https://rutracker.org/forum/dl.php?t=<тема>` (или ссылку из `personal-migration-list.html`)
+   и сохранить файл.
+4. Импорт:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Import-PersonalTorrent.ps1 "$env:USERPROFILE\Downloads\<файл>.torrent" -Topic <тема> -StateDirectory C:\TorrentMonitor`
+5. Dry Run этой раздачи:
+   `powershell -NoProfile -ExecutionPolicy Bypass -File .\Test-PersonalMigration.ps1 -Topic <тема> -StateDirectory C:\TorrentMonitor`
+6. Проверка, что рабочая папка не менялась, — как в шагах 1 и 7 «Проверки на реальном ПК» выше.
+
+`16-Import-personal-torrent.cmd` и `17-Check-personal-migration.cmd` принимают те же параметры.
+На `16-…` можно перетащить скачанный файл: папку с `auto-state.json` скрипт спросит сам.
+Перепривязку (замену трекера) этот шаг не выполняет. Её делает `12-Tracker-migration-one.cmd` в рабочей установке
+после обновления и отдельного подтверждения. Начисление статистики подтверждается только после неё (план выше).
+
+**Первоначальная настройка.**
+1. Маршрут к rutracker.org: `15-RuTracker-connection.cmd` должен показать «РАБОТАЕТ» (напрямую или через локальный
+   прокси, см. выше).
+2. Запустите `9-RuTracker-login.cmd` **под тем пользователем Windows, под которым работает монитор**, и введите
+   логин и пароль RuTracker. Если сайт попросит CAPTCHA, картинка откроется, код вводится вручную (до 3 попыток).
+3. Скрипт сразу проверяет результат: скачивает персональный `.torrent` одной из текущих тем ленты, сверяет infohash
+   и показывает сервер статистики (без ключа). В µTorrent при этом ничего не добавляется.
+4. `10-RuTracker-check.cmd` — повторная проверка в любой момент, без ввода пароля.
+
+**Перепривязка уже скачанных раздач без повторной загрузки.**
+Раздачи, добавленные TorrentControl раньше, работают с публичным адресом. `Migrate-Trackers.ps1` меняет у них только
+список трекеров через WebUI: `setprops` с `s=trackers` — тот же запрос, что отправляет окно свойств официального
+WebUI. Файлы, пути, данные, прогресс, метки и история не меняются; раздачи не удаляются и не пересоздаются.
+- Рассматриваются только записи `auto-state.json` со статусом «Добавлено, путь подтверждён», найденные в µTorrent
+  в своей папке `D:\Фильмы\rt-<тема>` и использующие **только** публичный адрес. Ручные, перемещённые раздачи
+  и раздачи с другими трекерами не изменяются (пропуск с причиной в отчёте). «Уже персональный трекер» ставится
+  только по тому же строгому правилу; посторонние и смешанные списки — «Пропущено» (`UnexpectedTrackers`).
+- Ошибки WebUI записываются кодом `WebUIRequestFailed`, без текста исключения: в нём мог бы оказаться адрес с ключом.
+- Для каждой скачивается персональный `.torrent` темы и сверяется infohash; при несовпадении — пропуск.
+- Порядок:
+  1. `11-Tracker-migration-dry-run.cmd` — Dry Run: ничего не меняет, создаёт `tracker-migration.html` и `.csv`.
+  2. `12-Tracker-migration-one.cmd` — одна раздача: hash из отчёта и подтверждение вводом `YES <первые 8 символов hash>`.
+     После замены список трекеров перечитывается из µTorrent и сравнивается; проверяются путь, размер, прогресс,
+     остаток и отсутствие перепроверки. Любое расхождение — остановка, статус «Ошибка — проверьте вручную».
+  3. Проверка начисления (план ниже), затем `13-Tracker-migration-verified.cmd` с вводом `VERIFIED <8 символов>`.
+  4. Только после этого пакет: `14-Tracker-migration-batch.cmd` с вводом `YES BATCH`. Раздачи обрабатываются
+     по одной, с остановкой на первой проблеме.
+- `tracker-migration.json` хранит статус каждой раздачи (без ключа). Прерванная или неудачная замена
+  автоматически не повторяется — только явным `12-Tracker-migration-one.cmd` для этой раздачи.
+- Если µTorrent 2.2.1 не примет замену через WebUI, это будет видно на шаге 2 (`ReadBackMismatch`) без изменений
+  данных. Тогда перепривязку можно сделать вручную: свойства раздачи → поле «Трекеры» → вставить адреса
+  из персонального `.torrent` (`%LOCALAPPDATA%\TorrentControl\personal\<hash>.torrent`).
+
+**Проверка начисления на реальном ПК.** До неё нельзя считать, что статистика начисляется.
+1. `10-RuTracker-check.cmd` → «ПРОВЕРКА ПРОЙДЕНА», показан сервер статистики.
+2. `11-Tracker-migration-dry-run.cmd` → выбрать одну раздачу с заметной отдачей.
+3. `12-Tracker-migration-one.cmd` для неё → «Перепривязано — проверьте статистику».
+4. µTorrent, вкладка «Трекеры» этой раздачи: персональный сервер, статус «работает», после «Обновить трекер» — ответ без ошибки.
+   Ошибка подключения к этому серверу означает, что отдача не будет засчитана: пакет не запускать.
+5. В профиле RuTracker раздача появилась в списке текущих раздач (обычно в течение часа).
+6. Через несколько часов отдачи значение «Отдано» в профиле выросло; сравнить с отдачей в µTorrent за тот же период.
+   Статистика на сайте обновляется с задержкой.
+7. Только после этого `13-Tracker-migration-verified.cmd`, затем пакет. Для новых фильмов проверить одну новую
+   автозагрузку так же (п. 4–6).
 
 ## Автозагрузка
 
@@ -47,7 +433,8 @@
 - Хеши, уже имеющиеся в µTorrent на любом диске, пропускаются.
 - Перед запуском проверяются SHA-1 infohash, точный размер, имена и пути внутри метаданных.
   Отклоняются выходы из папки, ссылки, зарезервированные Windows-имена, конфликтующие пути и исполняемые файлы.
-  Внешние поля `.torrent`, не защищённые infohash, заменяются известным публичным трекером.
+  В µTorrent передаётся только персональный `.torrent` RuTracker с тем же infohash (см. «Персональная статистика RuTracker»);
+  публичные метаданные с GitHub служат лишь для проверки размера и путей заранее.
 - Ответ WebUI проверяется строго до любого действия автозагрузки — и первый список опроса, и повторный
   запрос непосредственно перед запуском µTorrent: типы и диапазоны полей 0, 1, 3, 4, 5, 6, 8, 12, 18 и
   отсутствие повторяющихся хешей. Хотя бы одно некорректное значение останавливает автозагрузку в этом опросе
@@ -165,6 +552,11 @@ Atom содержит `updated`, а не `published`: впервые замеч�
 - `monitor.log` — ошибки и результаты наблюдения; `auto-downloads.html` — состояния очереди.
 - «Ожидает метаданные» — GitHub ещё не получил `.torrent`, проверка повторится.
 - «Ожидает место» — не хватает места с учётом запаса и незавершённых заданий.
+- «Ожидает авторизацию RuTracker» — персональный `.torrent` не получен (причина в журнале); публичная версия не
+  добавляется. При сетевых кодах (`RuTrackerUnavailable`, `RuTrackerProxyUnavailable`, `RuTrackerTlsFailed`)
+  запустите `15-RuTracker-connection.cmd`; при `RuTrackerTlsComponentInvalid` скопируйте папку `lib` из той же
+  версии; иначе обычно помогает `9-RuTracker-login.cmd`;
+  проверка — `10-RuTracker-check.cmd`.
 - «Передано клиенту» — ждём появления хеша и пути в WebUI/resume.dat. Повторной передачи не будет.
 - «Нужна проверка» — проверьте задание и путь в µTorrent; следующие добавления блокируются.
   Затем запустите `8-Review-autoload.cmd`. Не удаляйте `auto-state.json` для обхода блокировки:
@@ -187,7 +579,29 @@ Atom содержит `updated`, а не `published`: впервые замеч�
 сбой запуска, существующий хеш на E:, подтверждение/ошибку пути, опасные имена и повреждённые метаданные.
 Полный цикл добавления реального нового фильма на пользовательском ПК предстоит подтвердить после включения.
 
-Автотесты `tests\Run-All.ps1` выполняются в GitHub Actions на Windows PowerShell 5.1 и PowerShell 7 для каждого PR:
+Тесты персональной статистики используют только вымышленные адреса и ключи (`bt`, `bt2`, `bt3`, `bt4`; `kk`, `pk`, `uk`):
+персональный адрес передаётся без замены, отсутствие входа и несовпадение infohash блокируют добавление и перепривязку,
+повреждённые файлы отклоняются, секреты не попадают в отчёты, перепривязка вызывает только `getprops`/`setprops trackers`
+и не трогает ручные раздачи, файлы и пути. Раннер также проверяет, что настоящая папка `%LOCALAPPDATA%\TorrentControl` не изменилась.
+
+Транспорт к RuTracker проверяется настоящими TLS-соединениями (`tests\Test-RuTrackerTls.ps1`): поддельные прокси
+на `127.0.0.x` играют роль HTTPS-прокси и `rutracker.org` с TLS 1.3 и одноразовыми тестовыми сертификатами.
+Проверяются анонимная проверка маршрута, вход, скачивание персонального `.torrent` до сохранения файла, истёкшая
+сессия, отказ для чужого infohash и публичного `.torrent`, переход между адресами прокси и отказы сертификатов
+(недоверенный корень, чужое имя, просроченный и ещё не действующий, без назначения «сервер», чужое имя у прокси);
+во всех отказах пароль и cookie не отправляются. Отдельно — пул из 9 адресов прокси, первые три из которых не
+работают: доходит до рабочего, запоминает его между запусками, после его отказа переходит к другому и запоминает
+новый; сетевые ошибки TLS с прокси отличаются от отказа сертификата (перебор останавливается); медленные адреса не
+выводят запрос за его предел; POST после обрыва ответа не повторяется через другой адрес. Тестовый корень нигде не устанавливается: в Linux ему доверяет
+только дочерний процесс через `SSL_CERT_FILE`, поэтому успешные сценарии выполняются в задании Linux, а отказы — везде.
+
+Команды обновления и отката из раздела «Развёртывание на рабочем ПК» выполняются тестом `tests\Test-Deployment.ps1`
+ровно как написаны, на модели `C:\TorrentMonitor` 1.8 во временной папке: идущий опрос, полная резервная копия,
+неизменность данных, поиск проверенной копии со входом, откат с выключением автозагрузки (в том числе в том же окне
+и при прерванном обновлении). Настоящая папка `C:\TorrentMonitor` тестами не затрагивается.
+
+Автотесты `tests\Run-All.ps1` выполняются в GitHub Actions на Windows PowerShell 5.1, PowerShell 7 и PowerShell 7
+в Linux для каждого PR:
 анализ спроса, защита истории, гонки и восстановление автозагрузки, расчёт места на D:, проверки копии ленты
 (свежесть, откат, разрывы, диагностика), разбор `resume.dat` и `.torrent`, а также отсутствие в коде удаления данных
 и изменяющих действий WebUI. Скрипты зеркала проверяются отдельно: `python3 -m unittest discover -s tests -p "test_*.py"`.
