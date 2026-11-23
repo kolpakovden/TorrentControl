@@ -67,6 +67,87 @@ function Get-HistoryPath($Row, $LocalPaths) {
     if ($path -notmatch '^[A-Za-z]:\\') { return '' }
     return $path
 }
+function Get-UnixNow { return [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() }
+# --- Upload history for cleanup (1.9) --------------------------------------------------------------
+# UPLOADED (index 6) is cumulative, so the delta between two consecutive polls is exact. Each delta is
+# stored per UTC hour: "in" when both polls fall into the same hour, "cross" (kept on the earlier hour)
+# when the interval crosses an hour boundary. A series is continuous only while every poll sees the
+# torrent complete, running, with known peers, at the same path, with a counter that never goes back,
+# and polls are at most MaxGap apart. Anything else starts a new series (uploadSince) - it is never
+# counted as zero upload. Only hours inside the last ~75 are kept, as a compact "hour,in,cross;..." string.
+function ConvertFrom-UploadHours([string]$Text) {
+    $map = @{}
+    if (!$Text) { return $map }
+    if ($Text.Length -gt 12000 -or $Text -notmatch '^\d{1,8},\d{1,16},\d{1,16}(;\d{1,8},\d{1,16},\d{1,16})*$') { return $null }
+    foreach ($part in $Text.Split(';')) {
+        $fields = $part.Split(',')
+        $hour = [long]$fields[0]
+        if ($map.ContainsKey($hour)) { return $null }
+        $map[$hour] = [long[]]@([long]$fields[1], [long]$fields[2])
+    }
+    return $map
+}
+function ConvertTo-UploadHours($Map, [long]$MinHour) {
+    $parts = foreach ($hour in @($Map.Keys | Where-Object { $_ -ge $MinHour } | Sort-Object)) {
+        $value = $Map[$hour]
+        if ($value[0] -gt 0 -or $value[1] -gt 0) { '{0},{1},{2}' -f $hour, $value[0], $value[1] }
+    }
+    return (@($parts) -join ';')
+}
+function Step-UploadHistory($Old, [string]$Restart, [bool]$Seeding, [long]$Uploaded, [long]$Now, [long]$MaxGap = 3600) {
+    if (!$Seeding) { return [pscustomobject]@{ since = 0L; hours = ''; note = 'NotSeeding' } }
+    $note = $Restart
+    if (!$note) {
+        $map = ConvertFrom-UploadHours ([string]$Old.uploadHours)
+        $since = [long]$Old.uploadSince
+        $then = [long]$Old.lastSeen
+        $hourNow = [long][math]::Floor($Now / 3600)
+        $hourThen = [long][math]::Floor($then / 3600)
+        $delta = $Uploaded - [long]$Old.uploaded
+        if ($null -eq $map) { $note = 'Damaged' }
+        elseif ($since -le 0 -or $since -gt $then) { $note = 'Start'; if ([string]$Old.uploadNote) { $note = [string]$Old.uploadNote } }
+        elseif ([int]$Old.missingPolls -gt 0) { $note = 'Missing' }
+        elseif ($Now - $then -gt $MaxGap -or $hourNow - $hourThen -gt 1) { $note = 'Gap' }
+        elseif ($delta -gt 1125899906842624) { $note = 'Invalid' }
+        else {
+            if (!$map.ContainsKey($hourThen)) { $map[$hourThen] = [long[]]@(0, 0) }
+            if ($hourNow -eq $hourThen) { $map[$hourThen][0] += $delta } else { $map[$hourThen][1] += $delta }
+            return [pscustomobject]@{ since = $since; hours = (ConvertTo-UploadHours $map ($hourNow - 75)); note = [string]$Old.uploadNote }
+        }
+    }
+    # This poll is the first sample of a new continuous series.
+    return [pscustomobject]@{ since = $Now; hours = ''; note = $note }
+}
+function Get-UploadSum($Map, [long]$First, [long]$Last) {
+    # Upper bound for whole UTC hours First..Last: deltas inside them plus every interval touching them.
+    $sum = 0L
+    for ($hour = $First - 1; $hour -le $Last; $hour++) {
+        if ($Map.ContainsKey($hour)) {
+            if ($hour -ge $First) { $sum += $Map[$hour][0] }
+            $sum += $Map[$hour][1]
+        }
+    }
+    return $sum
+}
+function Get-UploadWindows($Record, [long]$Now) {
+    # Three periods of 25 whole UTC hours each: hours H-24..H, H-48..H-24 and H-72..H-48 (H = current hour).
+    # Each contains the corresponding true 24-hour period ending now (and the two before it), and its sum
+    # is an upper bound, so "upper bound < 1 GiB" proves "less than 1 GiB" for that 24-hour period.
+    $hour = [long][math]::Floor($Now / 3600)
+    $since = [long]$Record.uploadSince
+    $map = ConvertFrom-UploadHours ([string]$Record.uploadHours)
+    $valid = ($null -ne $map -and $since -gt 0 -and [long]$Record.lastSeen -ge $hour * 3600 -and [long]$Record.lastSeen -le $Now)
+    $days = @($null, $null, $null)
+    for ($k = 1; $k -le 3; $k++) {
+        $first = $hour - 24 * $k
+        if ($valid -and $since -le $first * 3600) { $days[$k - 1] = Get-UploadSum $map $first ($hour - 24 * ($k - 1)) }
+    }
+    $total = $null
+    if ($valid -and $since -le ($hour - 72) * 3600) { $total = Get-UploadSum $map ($hour - 72) $hour }
+    $covered = 0.0
+    if ($valid) { $covered = [math]::Round(($Now - $since) / 3600, 1) }
+    [pscustomobject]@{ day1 = $days[0]; day2 = $days[1]; day3 = $days[2]; total72 = $total; complete = ($null -ne $total); hours = $covered }
+}
 function Update-History($Row, [string]$Path, $Old, [long]$Now) {
     $uploaded = [long]$Row[6]
     $status = [long]$Row[1]
@@ -77,7 +158,12 @@ function Update-History($Row, [string]$Path, $Old, [long]$Now) {
     $reasons = @()
     if ($knownPeers -and [long]$Row[8] -gt 0) { $reasons += 'UploadSpeed' }
     if ($knownPeers -and [long]$Row[12] -gt 0) { $reasons += 'ConnectedPeers' }
-    $reset = (!$Old -or $Old.path -ne $Path -or $Now -lt [long]$Old.lastSeen -or $uploaded -lt [long]$Old.uploaded)
+    $restart = ''
+    if (!$Old) { $restart = 'New' }
+    elseif ($Old.path -ne $Path) { $restart = 'Path' }
+    elseif ($Now -lt [long]$Old.lastSeen) { $restart = 'Clock' }
+    elseif ($uploaded -lt [long]$Old.uploaded) { $restart = 'Counter' }
+    $reset = [bool]$restart
     $first = $Now; $quiet = $Now; $total = 0L
     if (!$reset) {
         $first = [long]$Old.firstSeen
@@ -91,11 +177,13 @@ function Update-History($Row, [string]$Path, $Old, [long]$Now) {
     $demand = ($reasons.Count -gt 0)
     if (!$complete) { $first = $Now }
     if ($demand -or !$running -or !$complete -or !$knownPeers) { $quiet = $Now }
+    $upload = Step-UploadHistory $Old $restart ($complete -and $running -and $knownPeers) $uploaded $Now
     [pscustomobject]@{
         hash = ([string]$Row[0]).ToUpperInvariant(); path = $Path; firstSeen = $first; quietSince = $quiet
         lastSeen = $Now; uploaded = $uploaded; observedUpload = $total
         complete = $complete; running = $running; knownPeers = $knownPeers; demand = $demand
         demandReason = ($reasons -join ','); missingPolls = 0; missingSince = 0L
+        uploadSince = $upload.since; uploadHours = $upload.hours; uploadNote = $upload.note
     }
 }
 function Copy-HistoryRecord($Old, [int]$MissingPolls, [long]$MissingSince) {
@@ -105,6 +193,7 @@ function Copy-HistoryRecord($Old, [int]$MissingPolls, [long]$MissingSince) {
         observedUpload = [long]$Old.observedUpload; complete = [bool]$Old.complete; running = [bool]$Old.running
         knownPeers = [bool]$Old.knownPeers; demand = [bool]$Old.demand; demandReason = [string]$Old.demandReason
         missingPolls = $MissingPolls; missingSince = $MissingSince
+        uploadSince = [long]$Old.uploadSince; uploadHours = [string]$Old.uploadHours; uploadNote = [string]$Old.uploadNote
     }
 }
 function Merge-History($Rows, $LocalPaths, $PreviousItems, [long]$Now, [int]$DropPolls = 3, [long]$DropSeconds = 21600) {
@@ -141,7 +230,10 @@ function Merge-History($Rows, $LocalPaths, $PreviousItems, [long]$Now, [int]$Dro
         if (!$path) {
             if ($old) {
                 $copy = Copy-HistoryRecord $old 0 0
-                if ([int]$old.missingPolls -gt 0) { $copy.quietSince = $Now }
+                if ([int]$old.missingPolls -gt 0) {
+                    # It was absent from the list: back, but not measurable yet - its upload history starts again.
+                    $copy.quietSince = $Now; $copy.uploadSince = 0L; $copy.uploadHours = ''; $copy.uploadNote = 'Missing'
+                }
                 [void]$items.Add($copy); $kept++
             }
             continue
@@ -175,11 +267,4 @@ function Get-DemandLabel($State) {
     $labels = @()
     foreach ($code in ([string]$State.demandReason -split ',')) { if ($names.ContainsKey($code)) { $labels += $names[$code] } }
     return ($labels -join '; ')
-}
-function Get-Decision($State, [long]$Now) {
-    if (!$State.complete) { return 'Загрузка не завершена' }
-    if (!$State.running -or !$State.knownPeers) { return 'Недостаточно данных / остановлена' }
-    if ($State.demand) { return 'Есть спрос' }
-    if (($Now - $State.firstSeen) -ge 30*86400 -and ($Now - $State.quietSince) -ge 14*86400) { return 'Кандидат на удаление' }
-    return 'Наблюдение'
 }
